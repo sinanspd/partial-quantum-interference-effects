@@ -7,6 +7,8 @@ javaOptions += "-Xmx32G"
 lazy val root = (project in file("."))
   .settings(
     name := "scalaQ-psi-collapse",
+    Compile / run / mainClass := Some("com.sinanspd.Cham2"),
+    Compile / run / fork := true,
     libraryDependencies ++= Seq(
       Libraries.logback,
       "io.chymyst" %% "chymyst-core" % "0.2.0",
@@ -17,12 +19,6 @@ lazy val root = (project in file("."))
       "co.fs2" %% "fs2-io" % "3.9.3",
       "org.typelevel" %% "cats-effect" % "3.5.2",
       "com.sinanspd" %% "qure" % "0.1.20-SNAPSHOT"
-    ),
-    javaOptions ++= Seq(
-      
-    // -J params will be added as jvm parameters
-    "-J-Xmx32g",
-     "-Xmx32g"
     )
   )
   

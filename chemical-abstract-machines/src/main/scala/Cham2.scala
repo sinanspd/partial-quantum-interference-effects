@@ -1,405 +1,494 @@
-package com.sinanspd 
+package com.sinanspd
 
-import io.chymyst.jc._
-import org.slf4j.LoggerFactory
-import scala.util.Random
-import scala.util.control.NoStackTrace
-import fs2._
-import cats.effect.IO
-import cats.Eval
-import cats.effect.unsafe.implicits.global
-import com.sinanspd.qure.circuit._
 import com.sinanspd.qure.circuit.gates._
-import com.sinanspd.qure.circuit.circuitError._
-import com.sinanspd.qure.circuit.sampler._
-import com.sinanspd.qure.circuit.sampler.BasicSampler
-import cats.instances.int
-import spire.math._
-import spire.implicits._ 
+import com.sinanspd.qure.circuit.{Circuit, QVec}
+import io.chymyst.jc._
+import spire.math.Complex
+import spire.implicits._
 
+import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference, LongAdder}
+import java.nio.file.Paths
+import scala.util.Random
 
-//Fully Cham implementation 
+/**
+  * Experiment runner for the CHAM implementation.
+  *
+  * Select an experiment by editing ExperimentConfig.circuitAlias, then use
+  * `sbt run`. No program argument is consulted.
+  */
 object Cham2 extends App {
+  private val startedAtNanos = System.nanoTime()
+  private val experiment = ExperimentCatalog(ExperimentConfig.circuitAlias)
+  private val threshold = sys.props
+    .get(TrialProcessProtocol.thresholdProperty)
+    .fold(ExperimentConfig.threshold)(_.toDouble)
+  private val effectiveRandomSeed = sys.props
+    .get(TrialProcessProtocol.randomSeedProperty)
+    .fold(ExperimentConfig.randomSeed)(_.toLong)
+  private val trialId = sys.props.get(TrialProcessProtocol.trialIdProperty)
+  private val instanceCount =
+    ExperimentConfig.instanceCountOverride.getOrElse(experiment.instancesForThreshold(threshold))
+  private val bTotalPerCopy = experiment.leafMetrics.total
+  private val bCorrectPerCopy = experiment.leafMetrics.correct
+  private val bTotal = bTotalPerCopy * instanceCount
+  private val bCorrect = bCorrectPerCopy * instanceCount
 
-    val logger = LoggerFactory.getLogger("com.sinanspd.Cham2")
-    val concurrentInstances = 3 //10
-    val hScale : Double = 1.0 / Math.sqrt(2.0)
-    val decider = new Random()
-    val correctAnswers = List() 
-    val tp = BlockingPool(32) 
-    val terminateEarly = true
+  require(threshold > 0d, "ExperimentConfig.threshold must be greater than zero")
+  require(instanceCount > 0, "The experiment must use at least one circuit instance")
+  require(ExperimentConfig.workerThreads > 0, "workerThreads must be greater than zero")
+  require(
+    ExperimentConfig.completionJitterMillis >= 0,
+    "completionJitterMillis cannot be negative"
+  )
+  require(ExperimentConfig.shutdownDrainMillis >= 0, "shutdownDrainMillis cannot be negative")
 
-    //Molecules in the soup
-    val terminate = m[QVec]
-    //Intermediadery Circuit Molecules
-    val commit = m[(QVec, Circuit, String)]
-    // Apply Game 
-    val step = m[Unit]
-    // Use if you want to bake result back into the reaction 
-    val result = b[Unit, String] 
-   
-    @volatile
-    var med = false
-    // We can try volatile variables to keep track of mols (https://github.com/Chymyst/chymyst-core/blob/master/docs/chymyst09.md)
-    @volatile var mols = List()
-    
-    implicit class CircuitDeferral(c: Circuit){ 
-        def deferMeasurements = {
-            val rearrangedGates = c.remainingGates.foldLeft(List[Gate]())((a, b) => b match{
-                case b : DeferredMeasurement if(a.isEmpty) => 
-                    throw InvalidCircuitError("A DeferredMeasurement gate shouldn't appear at the beginning of a circuit")
-                case b : DeferredMeasurement => {
-                    val prevGate = a.takeRight(1).head
-                    prevGate match{
-                        case g: DeferredMeasurement => a.take(a.size - 1) :+ MultiDeferredMeasure(List(g.q, b.q))
-                        case _ => a :+ b
-                    }
-                }
-                case b : Measure => a :+ b
-                case _ => 
-                    if(a.isEmpty){
-                        a :+ b 
-                    }else{
-                        val prevGate = a.takeRight(1).head
-                         prevGate match{
-                            case DeferredMeasurement(_) | MultiDeferredMeasure(_) => 
-                                a.take(a.size - 1) ++ List(b, prevGate)
-                            case _ => a :+ b
-                        }
-                    }
-            })
-            new Circuit(rearrangedGates)
-        }
-    }
+  private val selectedSimonOutput = experiment.simonPostSelection.map { selection =>
+    val random = new Random(effectiveRandomSeed)
+    selection.possibleOracleOutputs(random.nextInt(selection.possibleOracleOutputs.length))
+  }
 
-    object Circuit{
-        def apply(remainingGates: List[Gate]) = new Circuit(remainingGates).deferMeasurements
-    }
+  private val samplePath =
+    sys.props
+      .get(TrialProcessProtocol.sampleFileProperty)
+      .map(Paths.get(_))
+      .getOrElse(
+        ExperimentConfig.outputDirectory.resolve(s"${experiment.alias}-sampled-state.txt")
+      )
+  private val sampledState = new SampledStateRecorder(
+    configuredOutputPath = Some(samplePath),
+    context = Vector(
+      "experiment" -> experiment.alias,
+      "backend" -> experiment.backend.label,
+      "threshold" -> threshold.toString,
+      "instances" -> instanceCount.toString,
+      "qubits" -> experiment.qubitCount.toString,
+      "randomSeed" -> effectiveRandomSeed.toString
+    ) ++ trialId.map("trialId" -> _).toVector
+  )
 
-    case class MultiDeferredMeasure(q: List[Int]) extends Gate 
-    case class DeferredMeasurement(q: Int) extends Gate 
-    case class ModGate(a: Int, n: Int) extends Gate 
+  private val generatedTerminalContributions = new LongAdder
+  private val interferenceReactions = new LongAdder
+  private val readyTerminalMolecules = new LongAdder
+  private val readyCorrectTerminalMolecules = new LongAdder
+  private val worldIds = new AtomicLong(0L)
+  private val stopRequested = new AtomicBoolean(false)
+  private val activityLock = new AnyRef
+  private final case class ActivitySnapshot(
+      generatedTerminals: Long,
+      interferenceReactions: Long,
+      bActive: Long,
+      bActiveCorrect: Long
+  )
+  private val selectedActivity = new AtomicReference[ActivitySnapshot]()
+  private val hScale = 1d / math.sqrt(2d)
+  private lazy val workerPool = BlockingPool(ExperimentConfig.workerThreads)
 
+  // A `ready` molecule has completed its circuit and may interfere. A
+  // `commit` molecule still has gates to execute and cannot be sampled.
+  private lazy val ready = m[QVec]
+  private lazy val commit = m[(QVec, Circuit, String)]
+  private lazy val step = m[Unit]
 
-    site(tp) (
-        go { case terminate(a) + terminate(b) ⇒ { //two intermediate results ready to interfere 
-                //logger.debug(s"Possible Reaction between $a and $b"); 
-                if(a.v.sameElements(b.v)){ 
-                    logger.info(s"Molecules compatible. Reaction starting $a, $b")
-                    val newQ = QVec(Complex(a.prop.real + b.prop.real, a.prop.imag + b.prop.imag), a.v)
-                    if(newQ.prop.real.abs >= 0.5){ //set threshold here 
-                        if(!med){
-                            logger.info(s"Threshold Passed")
-                            //med = true
-                            terminate(newQ)
-                            if(!terminateEarly){
-                               scaleAndSample()
-                            }else{
-                             println(s"---------------- RESULT -------- \n $newQ \n -------------------")
-                               tp.shutdownNow() 
-                            }
-                        }
-                    }else if(newQ.prop.real.abs == 0d){
-                        logger.debug("Destructive Interference")
-                    }else{
-                        logger.debug(s"Reaction finished, releasesing $newQ into the solution")
-                        terminate(newQ)
-                    }
-                }else{
-                    //logger.debug("Incompatible molecules. Returning molecules to the pool")
-                    terminate(a) + terminate(b)
-                }
+  private lazy val reactionSites: Unit = {
+    site(workerPool)(
+      go {
+        case ready(left) + ready(right) =>
+          if (stopRequested.get()) {
+            ()
+          } else if (left.v.sameElements(right.v)) {
+            interferenceReactions.increment()
+            val combined = QVec(
+              Complex(
+                left.prop.real + right.prop.real,
+                left.prop.imag + right.prop.imag
+              ),
+              left.v
+            )
+
+            if (combined.prop.abs >= threshold) {
+              selectSample(combined)
+            } else if (combined.prop.abs != 0d && !stopRequested.get()) {
+              ready(combined)
             }
-        }
+          } else if (!stopRequested.get()) {
+            ready(left) + ready(right)
+          }
+      }
     )
-    site(
-        go { //local progress 
-            case commit(a) + step(()) ⇒ { // I can specify thread pool here too (tp per reaction site)
-                if(a._2.remainingGates.length == 1){ //whatever we release here will be ready for interference
-                    Thread.sleep(scala.util.Random.nextInt(40))
-                    applyGate(a._2.remainingGates, a._1, true, a._3)
-                }else if(a._2.remainingGates.length > 1){
-                    applyGate(a._2.remainingGates, a._1, false, a._3)
-                }
-            }
-            
-        }
+
+    site(workerPool)(
+      go {
+        case commit((state, circuit, world)) + step(()) =>
+          if (stopRequested.get()) {
+            ()
+          } else circuit.remainingGates match {
+            case Nil =>
+              throw new IllegalStateException(
+                s"${experiment.alias} emitted a commit molecule with no remaining gates"
+              )
+            case gate :: remaining =>
+              if (remaining.isEmpty && ExperimentConfig.completionJitterMillis > 0) {
+                Thread.sleep(
+                  ThreadLocalRandom.current().nextInt(ExperimentConfig.completionJitterMillis)
+                )
+              }
+              applyGate(gate, remaining, state, world)
+          }
+      }
     )
-    
-    def applyGate(gates: List[Gate], v: QVec, fin: Boolean, world: String) =  // we need to re-release a step() every time otherwise there wont be enough in the pool 
-        gates.head match {
-            case _ @ X(t) => {
-                val nv = QVec(v.prop, v.v.updated(t, !v.v(t)))
-                if(fin){
-                    logger.debug(s"Done after X: $world, with $nv")
-                    terminate(nv) + step(())
-                }else{
-                    logger.debug(s"Applied X: $world, \n now: $nv, remaining: ${gates.tail}")
-                    commit((nv, Circuit(gates.tail), world)) + step(())
-                }
-            }
-            case _ @ H(t) => {
-                val sign = if (v.v(t)) {-1} else {1}
-                val ll = Complex(1d, 0)
-                if(fin){   
-                    val nc1 = Complex(sign * hScale * v.prop.real, sign * hScale * v.prop.imag)
-                    val nc2 = Complex(hScale * v.prop.real, hScale * v.prop.imag) 
-                    val m1 = if(v.v(t)){QVec(nc1, v.v)}else{QVec(nc1, v.v.updated(t, !v.v(t)))}
-                    val m2 = if(v.v(t)){QVec(nc2, v.v.updated(t, !v.v(t)))}else{QVec(nc2, v.v)}
+    ()
+  }
 
-                    // Uncomment the following 2 lines if you aren't running Simon
-                    logger.info(s"Done with H: $world, m1: $m1, m2: $m2")
-                    terminate(m1) + terminate(m2) + step(()) + step(())
-                    
-                    // Uncomment the following block if you are running Simon
-                    // This "fakes" the last half of the qubits being measured 
-                    // logger.debug(s"----------- Meas: $middleValue ----- Mine: $m1 ------- $m2")
-                    // if(m1.v.takeRight(v.v.length / 2).sameElements(middleValue)){
-                    //      val newMolecule = QVec(m1.prop, m1.v.take(v.v.length / 2))
-                    //      logger.debug(s"Done with H: $world, m1 is truncated: $newMolecule")
-                    //      terminate(newMolecule)
-                    //  }
-                    //  if(m2.v.takeRight(v.v.length / 2).sameElements(middleValue)){
-                    //      val newMolecule = QVec(m2.prop, m2.v.take(v.v.length / 2))
-                    //      logger.debug(s"Done with H: $world, m2 is truncated: $newMolecule")
-                    //      terminate(newMolecule)
-                    //  }
-                }else{
-                    val nc1 = Complex(sign * hScale * v.prop.real, sign * hScale * v.prop.imag)
-                    val nc2 = Complex(hScale * v.prop.real, hScale * v.prop.imag)
-                    val m1 = if(v.v(t)){QVec(nc1, v.v)}else{QVec(nc1, v.v.updated(t, !v.v(t)))}
-                    val m2 = if(v.v(t)){QVec(nc2, v.v.updated(t, !v.v(t)))}else{QVec(nc2, v.v)}
-                    val w1n = Random.nextInt()
-                    val w2n = Random.nextInt()
-                    logger.debug(s"Started with ${v.v} Applied H: World $w1n: $m1, World $w2n: $m2")
-                    commit((m1, Circuit(gates.tail), "World " + w1n)) + commit((m2, Circuit(gates.tail), "World " + w2n)) + step(()) + step(())
-                }
+  private def newWorld(): String = s"World ${worldIds.getAndIncrement()}"
+
+  private def release(next: QVec, remaining: List[Gate], world: String): Unit = {
+    if (stopRequested.get()) {
+      ()
+    } else if (remaining.nonEmpty) {
+      commit((next, Circuit(remaining), world)) + step(())
+    } else {
+      val terminal = terminalState(next)
+      var readyToEmit: Option[QVec] = None
+      var selected: Option[(QVec, ActivitySnapshot)] = None
+
+      activityLock.synchronized {
+        if (!stopRequested.get()) {
+          generatedTerminalContributions.increment()
+          terminal.foreach { terminalState =>
+            readyTerminalMolecules.increment()
+            if (experiment.isCorrectTerminalState(terminalState.v)) {
+              readyCorrectTerminalMolecules.increment()
             }
-            case CX(c, t) => 
-                if(fin){
-                    if(v.v(c)){
-                        logger.debug(s"Done after CX: $world, with ${QVec(v.prop, v.v.updated(t, !(v.v(t))))}")
-                        terminate(QVec(v.prop, v.v.updated(t, !(v.v(t))))) + step(())
-                    }else{
-                        logger.debug(s"Done after CX: $world, with ${QVec(v.prop, v.v)}")
-                        terminate(QVec(v.prop, v.v)) + step(())
-                    }
-                }else{
-                    if(v.v(c)){
-                        val nv = QVec(v.prop, v.v.updated(t, !(v.v(t))))
-                        logger.debug(s"Applied CX: $world, \n now: $nv")
-                        commit((nv, Circuit(gates.tail), world)) + step(())
-                    }else{
-                        val nv = QVec(v.prop, v.v)
-                        logger.debug(s"Applied CX: $world, \n now: $nv")
-                        commit((nv, Circuit(gates.tail), world)) + step(())
-                    }
-                }
-            case Swap(q1, q2) => 
-                val source = v.v(q1)
-                val target = v.v(q2)
-                val firstOverwrite = v.v.updated(q2, source)
-                val second = firstOverwrite.updated(q1, target)
-                if(fin){
-                    logger.debug(s"Done after Swap: $world, with ${QVec(v.prop, second)}")
-                    terminate(QVec(v.prop, second)) + step(())
-                }else{
-                    logger.debug(s"Applied Swap: $world, \n now: ${QVec(v.prop, second)}")
-                    commit((QVec(v.prop, second), Circuit(gates.tail), world)) + step(())    
-                }
-            case RZ(td, q) => 
-                val target = v.v(q)
-                val coefft = (c : Int) => c match{ //rough estimates are fine, estimates e^{+/- i theta / 2 } where theta = pi/n. We are passed n
-                    case -2 => Complex(0.7071, -0.7071) // e^{-i pi / 4}
-                    case 2 => Complex(0.7071, 0.7071) // e^{i pi / 4}
-                    case -4 => Complex(0.924, -0.383) // e^{-i pi / 8}
-                    case 4 => Complex(0.924, 0.383)  // e^{i pi / 8}
-                    case -8 => Complex(0.9808, -0.1951) // e^{-i pi / 16}
-                    case 8 => Complex(0.9808, 0.1951) // e^{i pi / 16}
-                    case -16 => Complex(0.9952, -0.0980) // e^{-i pi / 32}
-                    case 16 => Complex(0.9952, 0.0980) // e^{-i pi / 32}
-                }
-                if(fin){
-                    if(target){
-                        val coeff = coefft(td)
-                        val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                        logger.debug(s"Done after RZ: $world, with ${QVec(ph , v.v)}")
-                        terminate(QVec(ph, v.v)) + step(())
-                    }else{
-                        val coeff = coefft(-1 * td)
-                        val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                        logger.debug(s"Done after RZ: $world, with ${QVec(ph, v.v)}")
-                        terminate(QVec(ph, v.v)) + step(())
-                    }
-                }else{
-                    if(target){
-                        val coeff = coefft(td)
-                        val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                        logger.debug(s"Applied RZ: $world, \n now: ${QVec(ph, v.v)}")
-                        commit(QVec(ph , v.v) , Circuit(gates.tail), world) + step(())
-                    }else{
-                        val coeff = coefft(-1 * td)
-                        val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                        logger.debug(s"Applied RZ: $world, \n now: ${QVec(ph, v.v)}")
-                        commit(QVec(ph, v.v), Circuit(gates.tail), world) + step(())
-                    }
-                }
-            // case Rotate(td, q) => //RX
-            //     if(fin){
-            //         td match{
-            //             case -2 => terminate(QVec(v.prop * 1/0.5, v.v)) + step(())
-            //             case 2 => terminate(QVec(v.prop * 0.5, v.v)) + step(())
-            //             case -4 => terminate(QVec(v.prop * 1/0.25, v.v)) + step(())
-            //             case 4 => terminate(QVec(v.prop * 0.25, v.v)) + step(())
-            //             case -8 => terminate(QVec(v.prop * 1/0.125, v.v)) + step(())
-            //             case 8 => terminate(QVec(v.prop * 0.125, v.v)) + step(())
-            //             case -16 => terminate(QVec(v.prop * 1/0.0625, v.v)) + step(())
-            //             case 16 => terminate(QVec(v.prop * 0.0625, v.v)) + step(())
-            //         }
-                // }else{
-                //     td match{
-                //         case -2 => commit(QVec(v.prop * 1/0.5, v.v), Circuit(gates.tail), world) + step(())
-                //         case 2 => commit(QVec(v.prop * 0.5, v.v), Circuit(gates.tail), world) + step(()) 
-                //         case -4 => commit(QVec(v.prop * 1/0.25, v.v), Circuit(gates.tail), world) + step(())
-                //         case 4 => commit(QVec(v.prop * 0.25, v.v), Circuit(gates.tail), world) + step(()) 
-                //         case -8 => commit(QVec(v.prop * 1/0.125, v.v), Circuit(gates.tail), world) + step(())
-                //         case 8 => commit(QVec(v.prop * 0.125, v.v), Circuit(gates.tail), world) + step(())
-                //         case -16 => commit(QVec(v.prop * 1/0.0625, v.v), Circuit(gates.tail), world) + step(())
-                //         case 16 => commit(QVec(v.prop * 0.0625, v.v), Circuit(gates.tail), world) + step(())
-                //     }
-                // }
-            case CRotate(c, td, q) =>  
-                val target = v.v(c) 
-                val coefft = (a : Int) => a match{ //rough estimates are fine, estimates e^{+/- i theta / 2 } where theta = pi/n. We are passed n
-                    case -2 => Complex(0.7071, -0.7071) // e^{-i pi / 4}
-                    case 2 => Complex(0.7071, 0.7071) // e^{i pi / 4}
-                    case -4 => Complex(0.924, -0.383) // e^{-i pi / 8}
-                    case 4 => Complex(0.924, 0.383)  // e^{i pi / 8}
-                    case -8 => Complex(0.9808, -0.1951) // e^{-i pi / 16}
-                    case 8 => Complex(0.9808, 0.1951) // e^{i pi / 16}
-                    case -16 => Complex(0.9952, -0.0980) // e^{-i pi / 32}
-                    case 16 => Complex(0.9952, 0.0980) // e^{-i pi / 32}
-                }
-                if(target){ //control active 
-                    if(v.v(q)){
-                        if(fin){
-                            val coeff = coefft(td)
-                            val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                            logger.debug(s"(Last) Done after CRZ: $world, with ${QVec(ph , v.v)}")
-                            terminate(QVec(ph, v.v)) + step(()) + step(()) + step(())
-                        }else{
-                            val coeff = coefft(-1 * td)
-                            val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                            logger.debug(s"Applied CRZ: $world, with ${QVec(ph, v.v)}")
-                            commit((QVec(ph, v.v), Circuit(gates.tail), world)) + step(()) + step(()) + step(())
-                        }
-                    }else{
-                        if(fin){
-                            //val coeff = coefft(td)
-                            //val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                            logger.debug(s"Done after CRZ: $world, with: ${v}")
-                            terminate(v) + step(()) + step(()) + step(())
-                        }else{ 
-                            //val coeff = coefft(-1 * td)
-                            //val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                            logger.info(s"Applied RZ: $world, with: ${QVec(v.prop, v.v)}")
-                            commit(v, Circuit(gates.tail), world) + step(()) + step(()) + step(())
-                        }
-                    }
-                }else{
-                    if(fin){
-                       logger.debug(s"Done After CRZ: $world, with: ${v}")
-                       terminate(v) + step(()) // just drop the gate and move on 
-                    }else{
-                       logger.debug(s"Applied CRZ: $world, with: ${v}")
-                       commit(v, Circuit(gates.tail), world) + step(()) // just drop the gate and move on 
-                    }
-                }
-            case ModGate(a, n) =>
-                val rv: Vector[Boolean] = v.v.slice(0, 4)
-                val relevantbits = rv.map(a => if(a){1}else{0})
-                val rbstring = relevantbits.mkString("")
-                val in = Integer.parseInt(rbstring, 2)
-                val r = Math.floor(Math.pow(a, in) % n).toInt
-                val l = r.toBinaryString.toList.map(a => if(a == '1'){true}else{false})
-                if(fin){
-                    terminate(QVec(v.prop, rv ++ l)) + step(())
-                }else{
-                    commit(QVec(v.prop, rv ++ l), Circuit(gates.tail), world) + step(())
-                }
-            case _ => logger.info("Something Went Wrong, I Don't Recognize The Gate")
+
+            if (terminalState.prop.abs >= threshold) {
+              stopRequested.set(true)
+              val snapshot = captureActivity()
+              selectedActivity.set(snapshot)
+              selected = Some(terminalState -> snapshot)
+            } else {
+              readyToEmit = Some(terminalState)
+            }
+          }
         }
-    
+      }
 
-    def scaleAndSample() = {
-        println("SCALING........")
-        // terminate.volatileValue
-        logger.debug(terminate.logSoup)
-        println(terminate.volatileValue)
-        val x = terminate.logSoup.split("Molecules:")(1)
-        val each = x.split("terminate/P\\(QVec\\(")
-        val pps = each.map(s => {
-            val r = s.split(",\\)\\) * ")(0)
-            val p = r.split("\\+")(0).drop(1)
-            val v = r.split(",Vector").filter(u => u.contains("true") || u.contains("false"))
-            (p, v.toVector)
-        }).drop(1)
+      selected match {
+        case Some((state, _)) =>
+          require(sampledState.tryRecord(state), "The selected state recorder was already populated")
+        case None =>
+          readyToEmit.foreach { state =>
+            if (!stopRequested.get()) {
+              ready(state)
+            }
+          }
+      }
+      // Simon-discarded paths and stopped paths still return their progress token.
+      step(())
+    }
+  }
 
-        val sqred = pps.map(x => (x._1.toDouble * x._1.toDouble, x._2)).toList
-        val tot = sqred.foldLeft(0d)((a, b) => a + b._1)
-        val scale = 1 / tot
-        val scaled = pps.map(x => {
-            val castToBool = x._2.map(b => b == "true")
-            (x._1.toDouble * scale, castToBool)
-        })
-        println("pps+----")
-        scaled.foreach(println)
-        val r = new BasicSampler(scaled.toList).sample()
-        println("------------- RESULT -----------")
-        println(pps)
-        println(r)
+  private def terminalState(state: QVec): Option[QVec] =
+    experiment.simonPostSelection match {
+      case Some(selection) =>
+        val measuredOutput = selectedSimonOutput.get
+        if (state.v.takeRight(selection.inputQubits).sameElements(measuredOutput)) {
+          Some(QVec(state.prop, state.v.take(selection.inputQubits)))
+        } else {
+          None
+        }
+      case None =>
+        experiment.resultQubits match {
+          case Some(qubits) =>
+            Some(QVec(state.prop, qubits.map(state.v)))
+          case None =>
+            Some(state)
+        }
     }
 
-
-
-    //Basic DJ
-    //commit((QVec(Complex(1d, 0), Vector(false, false)), Circuit(List(X(1), H(0), H(1), CX(0,1), CX(0,1), H(0))), "World 0")) + step(())
-
-    // Example Simon Circuit 
-    // val fourbitsimon = Circuit(List(H(0), H(1), CX(0, 2), CX(0, 3), CX(1, 2), CX(1, 3), H(0), H(1)))
-    // val fakeSimonSampler = new FakeSimonSampler(fourbitsimon)
-    // val middleValue = fakeSimonSampler.sample()
-    // for(i <- 0 to concurrentInstances - 1){
-    //     commit((QVec(1d, Vector(false, false, false, false)), fourbitsimon, "World 0")) + step(()) + step(())
-    // }   
-
-    // Shor n=15
-    // val _15bitshor = QVec(1d, Vector(false, false, false ,false ,false, false, false, false)) 
-    // val n15shor = Circuit(List(H(0), H(1), H(2), H(3), X(0), X(1), X(2), X(3), 
-    // ModGate(2, 15), 
-    // H(0), CRotate(0, -2, 1), Swap(0, 1), CRotate(1, -4, 2), Swap(1, 2),
-    // H(1), CRotate(2, -8, 3), Swap(2, 3), CRotate(1, -2, 2), Swap(1, 2), CRotate(2, -4, 3),
-    // Swap(2, 3), H(2), CRotate(2, -2, 3), Swap(2, 3), H(3)
-    // ))
-    // for(i <- 0 to concurrentInstances - 1){
-    //     commit((_15bitshor, n15shor, "World 0")) + step(())
-    // }
-
-    val _g0000 = QVec(1d, Vector(false, false, false, false))
-    val grover0000 = Circuit(List(
-        H(0), H(1), H(2), H(3),
-        X(0), X(1), X(2), X(3),
-        CRotate(0, 2, 3), CX(0, 1), CRotate(1, -2, 3), CX(0, 1), CRotate(1, 2, 3), CX(1, 2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3), CX(1, 2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3),
-        X(1), X(0), X(2), X(3), H(0), H(1), H(2), H(3), //r2
-        X(1), X(0), X(2), X(3),
-        CRotate(0, 2, 3), CX(0, 1), CRotate(1, -2, 3), CX(0, 1), CRotate(1, 2, 3), CX(1,2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3), CX(1, 2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3),
-        X(1), X(0), X(2), X(3), H(0), H(1), H(2), H(3)))
-
-    commit((_g0000, grover0000, "World 0")) + step() 
-
-    for(i <- 0 to concurrentInstances - 1){
-        commit((_g0000, grover0000, "World 0")) + step() 
+  private def selectSample(state: QVec): Unit = {
+    val snapshot = activityLock.synchronized {
+      if (stopRequested.get()) {
+        None
+      } else {
+        stopRequested.set(true)
+        val selectedSnapshot = captureActivity()
+        selectedActivity.set(selectedSnapshot)
+        Some(selectedSnapshot)
+      }
     }
 
+    snapshot.foreach { _ =>
+      require(sampledState.tryRecord(state), "The selected state recorder was already populated")
+    }
+  }
+
+  private def captureActivity(): ActivitySnapshot =
+    ActivitySnapshot(
+      generatedTerminals = generatedTerminalContributions.sum(),
+      interferenceReactions = interferenceReactions.sum(),
+      bActive = readyTerminalMolecules.sum(),
+      bActiveCorrect = readyCorrectTerminalMolecules.sum()
+    )
+
+  private def applyGate(
+      gate: Gate,
+      remaining: List[Gate],
+      state: QVec,
+      world: String
+  ): Unit =
+    gate match {
+      case X(target) =>
+        release(
+          QVec(state.prop, state.v.updated(target, !state.v(target))),
+          remaining,
+          world
+        )
+
+      case H(target) =>
+        val sign = if (state.v(target)) -1d else 1d
+        val same = QVec(
+          Complex(sign * hScale * state.prop.real, sign * hScale * state.prop.imag),
+          state.v
+        )
+        val flipped = QVec(
+          Complex(hScale * state.prop.real, hScale * state.prop.imag),
+          state.v.updated(target, !state.v(target))
+        )
+
+        release(same, remaining, newWorld())
+        release(flipped, remaining, newWorld())
+
+      case CX(control, target) =>
+        val nextBits =
+          if (state.v(control)) state.v.updated(target, !state.v(target)) else state.v
+        release(QVec(state.prop, nextBits), remaining, world)
+
+      case CCX(control1, control2, target) =>
+        val nextBits =
+          if (state.v(control1) && state.v(control2))
+            state.v.updated(target, !state.v(target))
+          else state.v
+        release(QVec(state.prop, nextBits), remaining, world)
+
+      case CZ(control, target) =>
+        val nextAmplitude =
+          if (state.v(control) && state.v(target)) state.prop * -1d else state.prop
+        release(QVec(nextAmplitude, state.v), remaining, world)
+
+      case PhaseFlipWhenAllOne(qubits) =>
+        val nextAmplitude =
+          if (qubits.forall(state.v)) state.prop * -1d else state.prop
+        release(QVec(nextAmplitude, state.v), remaining, world)
+
+      case Swap(q1, q2) =>
+        val swapped = state.v.updated(q1, state.v(q2)).updated(q2, state.v(q1))
+        release(QVec(state.prop, swapped), remaining, world)
+
+      case RZ(thetaDenominator, target) =>
+        val nextAmplitude =
+          RotationMath.applyRz(state.prop, thetaDenominator, state.v(target))
+        release(QVec(nextAmplitude, state.v), remaining, world)
+
+      case CRotate(control, thetaDenominator, target) =>
+        val nextAmplitude = RotationMath.applyControlledRotate(
+          state.prop,
+          thetaDenominator,
+          state.v(control),
+          state.v(target)
+        )
+        release(QVec(nextAmplitude, state.v), remaining, world)
+
+      case Rotate(thetaDenominator, target) =>
+        val nextAmplitude =
+          RotationMath.applyPhase(state.prop, thetaDenominator, state.v(target))
+        release(QVec(nextAmplitude, state.v), remaining, world)
+
+      case ModularExponentiation(base, modulus, inputQubits, outputQubits) =>
+        val exponent = inputQubits.foldLeft(0) { (value, qubit) =>
+          (value << 1) | (if (state.v(qubit)) 1 else 0)
+        }
+        val modularResult =
+          BigInt(base).modPow(BigInt(exponent), BigInt(modulus)).toInt
+        val nextBits = outputQubits.zipWithIndex.foldLeft(state.v) {
+          case (current, (qubit, index)) =>
+            val shift = outputQubits.length - index - 1
+            current.updated(qubit, ((modularResult >> shift) & 1) == 1)
+        }
+        release(QVec(state.prop, nextBits), remaining, world)
+
+      case Measure(_) =>
+        throw new UnsupportedOperationException(
+          "Measurements must be represented by an experiment terminal policy"
+        )
+
+      case unsupported =>
+        throw new UnsupportedOperationException(
+          s"${experiment.alias} contains unsupported gate $unsupported"
+        )
+    }
+
+  private def formatPathEstimate(hadamards: Long): String = {
+    val log10 = hadamards * math.log10(2d) + math.log10(instanceCount.toDouble)
+    if (hadamards <= 50) {
+      (BigInt(instanceCount) * (BigInt(1) << hadamards.toInt)).toString
+    } else {
+      f"$instanceCount%,d x 2^$hadamards%,d (approximately 10^$log10%.1f)"
+    }
+  }
+
+  private val correctnessDescription =
+    experiment.shorPostProcessing
+      .map(_.correctnessDescription)
+      .getOrElse(experiment.correctOutcomes.description)
+
+  private val successTarget =
+    experiment.shorPostProcessing
+      .map(_.targetDescription)
+      .getOrElse(experiment.correctOutcomes.renderedStates)
+
+  private def printRunSummary(): Unit = {
+    val backendHadamards = experiment.hadamardCount.toLong
+
+    println(
+      s"""
+         |===================== EXPERIMENT =====================
+         |alias:       ${experiment.alias}
+         |description: ${experiment.description}
+         |backend:     ${experiment.backend.label}
+         |qubits:      ${experiment.qubitCount}
+         |instances:   $instanceCount
+         |copy source: ${if (ExperimentConfig.instanceCountOverride.isDefined) "override" else "threshold/catalog"}
+         |threshold:   $threshold
+         |Hadamards:   $backendHadamards
+         |path scale:  ${formatPathEstimate(backendHadamards)}
+         |B_total:     $bTotal ($bTotalPerCopy per copy)
+         |B_correct:   $bCorrect ($bCorrectPerCopy per copy)
+         |check bits:  ${experiment.correctOutcomes.observedQubits.mkString(",")}
+         |success:     $successTarget
+         |output:      ${samplePath.toAbsolutePath.normalize}
+         |aliases:     ${ExperimentCatalog.aliases.mkString(", ")}
+         |======================================================""".stripMargin
+    )
+
+    selectedSimonOutput.foreach { output =>
+      println(s"Simon post-selected oracle output: ${output.map(if (_) '1' else '0').mkString}")
+    }
+    experiment.paperTerminalContributions.foreach { total =>
+      println(s"Paper terminal-contribution count: $total")
+    }
+    experiment.shorPostProcessing.foreach { _ =>
+      println(s"Reference quantum frequency bins: ${experiment.correctOutcomes.renderedStates}")
+    }
+    println(s"Correctness definition: $correctnessDescription")
+    experiment.notes.foreach(note => println(s"Note: $note"))
+  }
+
+  private def runChamPathSum(): Unit = {
+    if (experiment.gates.isEmpty) {
+      throw new IllegalArgumentException(
+        s"${experiment.alias} has no gates for the CHAM path-sum backend"
+      )
+    }
+
+    reactionSites
+    (0 until instanceCount).foreach { copy =>
+      commit((experiment.initialState, Circuit(experiment.gates), s"Copy $copy")) + step(())
+    }
+  }
+
+  printRunSummary()
+
+  if (ExperimentConfig.preflightOnly) {
+    println("Preflight complete; no circuit molecules were emitted.")
+    System.exit(0)
+  }
+
+  runChamPathSum()
+
+  val selected = sampledState.awaitSample()
+  stopRequested.set(true)
+  val observedOutcome = experiment.correctOutcomes.observe(selected.v)
+  val observedBits = observedOutcome.map(if (_) '1' else '0').mkString
+  val shorPostProcessingResult =
+    experiment.shorPostProcessing.map(_.process(observedOutcome))
+  val isCorrect = shorPostProcessingResult
+    .map(_.success)
+    .getOrElse(experiment.correctOutcomes.states.contains(observedOutcome))
+  val elapsedMillis = (System.nanoTime() - startedAtNanos) / 1000000L
+  private val activityAtSelection = Option(selectedActivity.get()).getOrElse(
+    throw new IllegalStateException("A sampled state was recorded without an activity snapshot")
+  )
+  val terminalContributionsAtSelection = activityAtSelection.generatedTerminals
+  val interferenceReactionsAtSelection = activityAtSelection.interferenceReactions
+  val correctnessMetadata =
+    experiment.shorPostProcessing match {
+      case Some(postProcessing) =>
+        Vector(
+          "correctnessMethod" -> "shor-classical-factor-recovery",
+          "correctOutcomeStates" -> "post-processing-dependent",
+          "referenceFrequencyBins" -> experiment.correctOutcomes.renderedStates,
+          "shorMaxIntermediateConvergents" ->
+            postProcessing.maxIntermediateConvergents.toString,
+          "shorMaxDenominatorMultiple" ->
+            postProcessing.maxDenominatorMultiple.toString
+        )
+      case None =>
+        Vector(
+          "correctnessMethod" -> "accepted-state-membership",
+          "correctOutcomeStates" -> experiment.correctOutcomes.renderedStates
+        )
+    }
+  sampledState.appendMetadata(
+    Vector(
+      "selectedAtTerminalContributions" -> terminalContributionsAtSelection.toString,
+      "selectedAtInterferenceReactions" -> interferenceReactionsAtSelection.toString,
+      "B_total" -> bTotal.toString,
+      "B_correct" -> bCorrect.toString,
+      "B_active" -> activityAtSelection.bActive.toString,
+      "B_activecorrect" -> activityAtSelection.bActiveCorrect.toString,
+      "B_totalPerCopy" -> bTotalPerCopy.toString,
+      "B_correctPerCopy" -> bCorrectPerCopy.toString,
+      "observedOutcome" -> observedBits,
+      "isCorrect" -> isCorrect.toString,
+      "correctnessDefinition" -> correctnessDescription,
+      "elapsedMillis" -> elapsedMillis.toString
+    ) ++ correctnessMetadata ++ shorPostProcessingResult.toVector.flatMap(_.metadata)
+  )
+  shorPostProcessingResult.foreach { result =>
+    val postProcessing = experiment.shorPostProcessing.get
+    result.printReport(postProcessing.modulus, postProcessing.base)
+  }
+  println(
+    s"""
+       |=================== OUTCOME CHECK ====================
+       |observed:       $observedBits
+       |correct:        ${if (isCorrect) "YES" else "NO"}
+       |B_total:        $bTotal
+       |B_correct:      $bCorrect
+       |B_active:       ${activityAtSelection.bActive}
+       |B_activecorrect:${activityAtSelection.bActiveCorrect}
+       |success target: $successTarget
+       |definition:     $correctnessDescription
+       |======================================================""".stripMargin
+  )
+  println(
+    s"Run complete: sampled ${selected.v.map(if (_) '1' else '0').mkString}; " +
+      s"generated terminals=$terminalContributionsAtSelection, " +
+      s"interference reactions=$interferenceReactionsAtSelection, elapsed=${elapsedMillis}ms"
+  )
+
+  if (ExperimentConfig.terminateAfterSample) {
+    if (ExperimentConfig.shutdownDrainMillis > 0) {
+      Thread.sleep(ExperimentConfig.shutdownDrainMillis.toLong)
+    }
+    workerPool.shutdownNow()
+  }
+
+  // Chymyst 0.2.0 owns non-daemon scheduler threads even after its explicit
+  // pool is stopped. `sbt run` is forked, so ending this experiment JVM is the
+  // clean lifecycle boundary and cannot terminate the sbt shell itself.
+  if (ExperimentConfig.terminateAfterSample) {
+    System.exit(0)
+  }
 }
-

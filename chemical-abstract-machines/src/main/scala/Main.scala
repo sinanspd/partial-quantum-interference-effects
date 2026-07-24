@@ -60,11 +60,16 @@ object Main extends App {
     val hScale : Double = 1.0 / Math.sqrt(2.0)
     val decider = new Random()
     val terminateEarly = true;
+    val threshold = sys.props
+      .get("cham.threshold")
+      .orElse(sys.env.get("CHAM_THRESHOLD"))
+      .fold(0.1)(_.toDouble)
+    require(threshold > 0d, "cham.threshold must be greater than zero")
 
     val r = m[QVec]
     val tp = BlockingPool(32) 
 
-    var med = false
+    val sampledState = new SampledStateRecorder
 
     implicit class CircuitDeferral(c: Circuit){ 
         def deferMeasurements = {
@@ -112,19 +117,15 @@ object Main extends App {
                     if(newQ.v(0) && newQ.v(1) && newQ.v(2) && newQ.v(3) && newQ.v(4)){
                         logger.debug(s"What I need $newQ")
                     }
-                    if(newQ.prop.real.abs >= 0.1){
-                        if(!med){
-                            logger.info(s"Result $newQ")
-                            med = true
+                    if(newQ.prop.abs >= threshold){
+                        if(sampledState.tryRecord(newQ)){
+                            logger.info(s"Threshold $threshold passed: $newQ")
                             if(!terminateEarly){
                                 scaleAndSample()
-                            }else{
-                               println(s"---------------- RESULT -------- \n $newQ \n -------------------")
-                               tp.shutdownNow() 
                             }
                         }
                         
-                    }else if(newQ.prop.real == 0.0){
+                    }else if(newQ.prop.abs == 0.0){
                         logger.debug("Destrictive Interference")
                     }else{
                         logger.debug(s"Reaction finished, releasesing $newQ into the solution")
@@ -157,7 +158,7 @@ object Main extends App {
                 //}
 
                 //for the very large grover with ancillas 
-                logger.info("Releasing " + QVec(v.prop, v.v.take(5)))
+                logger.debug("Releasing " + QVec(v.prop, v.v.take(5)))
                 // This is needed for the giant grover instance otherwise the pool crashes 
                 IO.sleep(FiniteDuration(scala.util.Random.nextInt(40), scala.concurrent.duration.SECONDS)) *>  IO.pure(r(QVec(v.prop, v.v.take(5))))
             case x :: xs => 
@@ -198,64 +199,19 @@ object Main extends App {
                          val firstOverwrite = v.v.updated(q2, source)
                          val second = firstOverwrite.updated(q1, target)
                          build(Circuit(xs), QVec(v.prop, second))
-                    case RZ(td, q) => 
-                        val target = v.v(q)
-                        val coefft = (c : Int) => c match{ //rough estimates are fine, estimates e^{+/- i theta / 2 } where theta = pi/n. We are passed n
-                            case -2 => Complex(0.7071, -0.7071) // e^{-i pi / 4}
-                            case 2 => Complex(0.7071, 0.7071) // e^{i pi / 4}
-                            case -4 => Complex(0.924, -0.383) // e^{-i pi / 8}
-                            case 4 => Complex(0.924, 0.383)  // e^{i pi / 8}
-                            case -8 => Complex(0.9808, -0.1951) // e^{-i pi / 16}
-                            case 8 => Complex(0.9808, 0.1951) // e^{i pi / 16}
-                            case -16 => Complex(0.9952, -0.0980) // e^{-i pi / 32}
-                            case 16 => Complex(0.9952, 0.0980) // e^{-i pi / 32}
-                        }
-                        if(target){
-                            val coeff = coefft(td)
-                            val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                            logger.debug(s"Done after RZ, with ${QVec(ph , v.v)}")
-                            build(Circuit(xs), QVec(ph , v.v))
-                        }else{
-                            val coeff = coefft(-1 * td)
-                            val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                            logger.debug(s"Done after RZ, with ${QVec(ph, v.v)}")
-                            build(Circuit(xs), QVec(ph, v.v))
-                        }
-                    case Rotate(td, q) => 
-                        td match{
-                            case -2 => build(Circuit(xs), QVec(v.prop * 1/0.5, v.v))
-                            case 2 => build(Circuit(xs), QVec(v.prop * 0.5, v.v))
-                            case -4 => build(Circuit(xs), QVec(v.prop * 1/0.25, v.v))
-                            case 4 => build(Circuit(xs), QVec(v.prop * 0.25, v.v))
-                            case -8 => build(Circuit(xs), QVec(v.prop * 1/0.125, v.v))
-                            case 8 => build(Circuit(xs), QVec(v.prop * 0.125, v.v))
-                            case -16 => build(Circuit(xs), QVec(v.prop * 1/0.0625, v.v))
-                            case 16 => build(Circuit(xs), QVec(v.prop * 0.0625, v.v))
-                        }
-                    case CRotate(c, td, q) => //controlled RZ 
-                        val target = v.v(c) 
-                        val coefft = (a : Int) => a match{ //rough estimates are fine, estimates e^{+/- i theta / 2 } where theta = pi/n. We are passed n
-                            case -2 => Complex(0.7071, -0.7071) // e^{-i pi / 4}
-                            case 2 => Complex(0.7071, 0.7071) // e^{i pi / 4}
-                            case -4 => Complex(0.924, -0.383) // e^{-i pi / 8}
-                            case 4 => Complex(0.924, 0.383)  // e^{i pi / 8}
-                            case -8 => Complex(0.9808, -0.1951) // e^{-i pi / 16}
-                            case 8 => Complex(0.9808, 0.1951) // e^{i pi / 16}
-                            case -16 => Complex(0.9952, -0.0980) // e^{-i pi / 32}
-                            case 16 => Complex(0.9952, 0.0980) // e^{-i pi / 32}
-                        }
-                        if(target){
-                            if(v.v(q)){
-                                val coeff = coefft(td)
-                                val ph = new Complex((v.prop.real * coeff.real) - (v.prop.imag * coeff.imag), (v.prop.real * coeff.imag) + (v.prop.imag * coeff.real))
-                                logger.debug(s"Done after CRZ, with ${QVec(ph , v.v)}")
-                                build(Circuit(xs), QVec(ph , v.v))
-                            }else{
-                                build(Circuit(xs), v)
-                            }
-                        }else{
-                            build(Circuit(xs), v)
-                        }
+                    case RZ(td, q) =>
+                        val ph = RotationMath.applyRz(v.prop, td, v.v(q))
+                        logger.debug(s"Done after RZ, with ${QVec(ph, v.v)}")
+                        build(Circuit(xs), QVec(ph, v.v))
+                    case Rotate(td, q) =>
+                        val ph = RotationMath.applyPhase(v.prop, td, v.v(q))
+                        logger.debug(s"Done after phase rotation, with ${QVec(ph, v.v)}")
+                        build(Circuit(xs), QVec(ph, v.v))
+                    case CRotate(c, td, q) =>
+                        val ph =
+                            RotationMath.applyControlledRotate(v.prop, td, v.v(c), v.v(q))
+                        logger.debug(s"Done after controlled rotation, with ${QVec(ph, v.v)}")
+                        build(Circuit(xs), QVec(ph, v.v))
                 
                     case CZ(ctrl, target) =>  
                         if(v.v(ctrl) && v.v(target)){
@@ -389,4 +345,8 @@ object Main extends App {
 
      val _g511111 = QVec(1d, Vector(false, false, false, false, false, false, false ,false))
      Stream.eval(build(g511111, _g511111)).compile.toVector.unsafeRunSync()
+     sampledState.awaitSample()
+     if(terminateEarly){
+         tp.shutdownNow()
+     }
 }
