@@ -1,352 +1,787 @@
-package com.sinanspd 
+package com.sinanspd
 
-import io.chymyst.jc._
-import org.slf4j.LoggerFactory
-import scala.util.Random
-import scala.math._
-import spire.math._
-import spire.implicits._ 
-import scala.util.control.NoStackTrace
-import fs2._
-import cats.effect.IO
-import cats.Eval
+import cats.effect.{Deferred, IO}
 import cats.effect.unsafe.implicits.global
-import com.sinanspd.qure.circuit._
+import cats.syntax.all._
+import com.sinanspd.qure.circuit.QVec
 import com.sinanspd.qure.circuit.gates._
-import com.sinanspd.qure.circuit.circuitError._
-import com.sinanspd.qure.circuit.sampler._
-import scala.concurrent.ExecutionContext
-import scala.concurrent.duration.FiniteDuration
+import fs2.Stream
+import io.chymyst.jc._
+import spire.implicits._
+import spire.math.Complex
 
-/// This implementation uses streaming to concurrently evaluate the circuit, then falls back
-// to CHAM to built interference. More efficient than the fully CHAM implementation 
+import java.nio.file.Paths
+import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference, LongAdder}
+import scala.annotation.tailrec
+import scala.concurrent.duration._
+import scala.util.Random
 
-class FakeSimonSampler(c: Circuit) extends Sampler {
-        val s = getRandomStateSpace()
-
-        private def getRandomStateSpace() = {
-            val numberOfH = c.remainingGates.collect { case a : H => a }.length
-            val s = gen(2, List()).filter(l => l.forall(_ == l.head))
-            s(new Random().nextInt(s.length))
-        }
-
-        private def gen(n: Int, acc: List[Vector[Boolean]]) : List[Vector[Boolean]] = {
-            if (n == 0) {
-                acc
-            } else {
-                if (acc.length == 0) {
-                gen(n - 1, List(Vector(false), Vector(true)))
-                } else {
-                gen(n - 1, (for (i <- acc) yield i :+ false) ++ (for (j <- acc) yield j :+ true))
-                }
-            }
-        }
-
-        def sample() = s
-}
-
-class FakeShorSampler() extends Sampler{ 
-    def sample() = Vector(true, false, false, false) //doesn't matter what this returns 
-}
-
-case class ModGate(a: Int, n: Int) extends Gate 
-
+/**
+  * Bounded FS2 path generation with CHAM endpoint interference.
+  *
+  * Unlike the legacy prototype that used to live in this file, this entry
+  * point runs the circuit selected in ExperimentConfig and implements the same
+  * sampling, correctness, metrics, and child-process protocol as Cham2.
+  */
 object Main extends App {
+  private final case class PathPartition(state: QVec, remainingGates: List[Gate])
 
-    val correctAnswers = List()  
-    val concurrentInstances = 4 // Fill this out before running 
-    
-    val logger = LoggerFactory.getLogger("example.Main")
-    val hScale : Double = 1.0 / Math.sqrt(2.0)
-    val decider = new Random()
-    val terminateEarly = true;
-    val threshold = sys.props
-      .get("cham.threshold")
-      .orElse(sys.env.get("CHAM_THRESHOLD"))
-      .fold(0.1)(_.toDouble)
-    require(threshold > 0d, "cham.threshold must be greater than zero")
+  private final case class ActivitySnapshot(
+      generatedTerminals: Long,
+      interferenceReactions: Long,
+      bActive: Long,
+      bActiveCorrect: Long,
+      selection: ThresholdSelectionDecision
+  )
 
-    val r = m[QVec]
-    val tp = BlockingPool(32) 
+  private val backendLabel = "bounded FS2 path generation + CHAM endpoint interference"
+  private val startedAtNanos = System.nanoTime()
+  private val experiment = ExperimentCatalog(ExperimentConfig.circuitAlias)
+  private val threshold = sys.props
+    .get(TrialProcessProtocol.thresholdProperty)
+    .fold(ExperimentConfig.threshold)(_.toDouble)
+  private val effectiveRandomSeed = sys.props
+    .get(TrialProcessProtocol.randomSeedProperty)
+    .fold(ExperimentConfig.randomSeed)(_.toLong)
+  private val trialId = sys.props.get(TrialProcessProtocol.trialIdProperty)
+  private val instanceCount =
+    ExperimentConfig.instanceCountOverride.getOrElse(experiment.instancesForThreshold(threshold))
+  private val bTotalPerCopy = experiment.leafMetrics.total
+  private val bCorrectPerCopy = experiment.leafMetrics.correct
+  private val bTotal = bTotalPerCopy * instanceCount
+  private val bCorrect = bCorrectPerCopy * instanceCount
 
-    val sampledState = new SampledStateRecorder
+  require(threshold > 0d, "ExperimentConfig.threshold must be greater than zero")
+  require(instanceCount > 0, "The experiment must use at least one circuit instance")
+  require(ExperimentConfig.workerThreads > 0, "workerThreads must be greater than zero")
+  require(
+    ExperimentConfig.fs2BranchJitterMillis >= 0 &&
+      ExperimentConfig.fs2BranchJitterMillis < Int.MaxValue,
+    "fs2BranchJitterMillis must be between zero and Int.MaxValue - 1"
+  )
+  require(
+    ExperimentConfig.completionJitterMillis >= 0,
+    "completionJitterMillis cannot be negative"
+  )
+  require(ExperimentConfig.shutdownDrainMillis >= 0, "shutdownDrainMillis cannot be negative")
+  require(experiment.gates.nonEmpty, s"${experiment.alias} has no gates to stream")
 
-    implicit class CircuitDeferral(c: Circuit){ 
-        def deferMeasurements = {
-            val rearrangedGates = c.remainingGates.foldLeft(List[Gate]())((a, b) => b match{
-                case b : DeferredMeasurement if(a.isEmpty) => 
-                    throw InvalidCircuitError("A DeferredMeasurement gate shouldn't appear at the beginning of a circuit")
-                case b : DeferredMeasurement => {
-                    val prevGate = a.takeRight(1).head
-                    prevGate match{
-                        case g: DeferredMeasurement => a.take(a.size - 1) :+ MultiDeferredMeasure(List(g.q, b.q))
-                        case _ => a :+ b
-                    }
+  private val selectedSimonOutput = experiment.simonPostSelection.map { selection =>
+    val random = new Random(effectiveRandomSeed)
+    selection.possibleOracleOutputs(random.nextInt(selection.possibleOracleOutputs.length))
+  }
+  private val referenceMetrics =
+    CircuitReferenceMetrics.calculate(experiment, selectedSimonOutput, instanceCount)
+  private val bornRuleRandomSeed = effectiveRandomSeed ^ 0x5DEECE66DL
+  private val outcomeSelectionRandom = new Random(bornRuleRandomSeed)
+  private val fs2BranchJitterSeed =
+    Fs2BranchJitter.resolveSeed(ExperimentConfig.fs2BranchJitterSeedOverride)
+
+  private val samplePath = ExperimentOutputPaths.samplePath(
+    explicitPath =
+      sys.props.get(TrialProcessProtocol.sampleFileProperty).map(Paths.get(_)),
+    batchRoot = ExperimentConfig.repeatedTrialOutputDirectory,
+    experimentAlias = experiment.alias,
+    selectionMode = ExperimentConfig.outcomeSelectionMode,
+    threshold = threshold
+  )
+  private val sampledState = new SampledStateRecorder(
+    configuredOutputPath = Some(samplePath),
+    context = Vector(
+      "experiment" -> experiment.alias,
+      "backend" -> backendLabel,
+      "threshold" -> threshold.toString,
+      "instances" -> instanceCount.toString,
+      "qubits" -> experiment.qubitCount.toString,
+      "randomSeed" -> effectiveRandomSeed.toString,
+      "outcomeSelectionMode" -> ExperimentConfig.outcomeSelectionMode.label,
+      "fs2BranchJitterMillis" -> ExperimentConfig.fs2BranchJitterMillis.toString,
+      "fs2BranchJitterSeed" -> fs2BranchJitterSeed.toString
+    ) ++ trialId.map("trialId" -> _).toVector
+  )
+
+  private val generatedTerminalContributions = new LongAdder
+  private val interferenceReactions = new LongAdder
+  private val readyTerminalMolecules = new LongAdder
+  private val readyCorrectTerminalMolecules = new LongAdder
+  private val stopRequested = new AtomicBoolean(false)
+  private val activityLock = new AnyRef
+  private val readyPoolAmplitudeTracker = new ReadyPoolAmplitudeTracker
+  private var interferenceReactionsInFlight = 0L
+  private val selectedActivity = new AtomicReference[ActivitySnapshot]()
+  private val hScale = 1d / math.sqrt(2d)
+  private lazy val endpointPool = BlockingPool(ExperimentConfig.workerThreads)
+  private lazy val ready = m[ReadyMolecule]
+
+  private lazy val reactionSite: Unit = {
+    site(endpointPool)(
+      go {
+        case ready(left) + ready(right)
+            if left.state.v.sameElements(right.state.v) =>
+          var selected = Option.empty[QVec]
+
+          activityLock.synchronized {
+            interferenceReactionsInFlight += 1L
+            readyPoolAmplitudeTracker.consumed(left)
+            readyPoolAmplitudeTracker.consumed(right)
+          }
+
+          try {
+            require(
+              left.isCorrect == right.isCorrect,
+              s"Endpoint ${left.state.v} was assigned inconsistent correctness"
+            )
+            val combined = QVec(
+              Complex(
+                left.state.prop.real + right.state.prop.real,
+                left.state.prop.imag + right.state.prop.imag
+              ),
+              left.state.v
+            )
+
+            activityLock.synchronized {
+              if (!stopRequested.get()) {
+                interferenceReactions.increment()
+                if (combined.prop.abs >= threshold) {
+                  stopRequested.set(true)
+                  val snapshot =
+                    captureActivity(ReadyMolecule(combined, left.isCorrect))
+                  selectedActivity.set(snapshot)
+                  selected = Some(snapshot.selection.selected.state)
+                } else if (combined.prop.abs != 0d) {
+                  emitReadyLocked(combined, left.isCorrect)
                 }
-                case b : Measure => a :+ b
-                case _ => 
-                    if(a.isEmpty){
-                        a :+ b 
-                    }else{
-                        val prevGate = a.takeRight(1).head
-                         prevGate match{
-                            case DeferredMeasurement(_) | MultiDeferredMeasure(_) => 
-                                a.take(a.size - 1) ++ List(b, prevGate)
-                            case _ => a :+ b
-                        }
-                    }
-            })
-
-            new Circuit(rearrangedGates)
-        }
-    }
-
-    object Circuit{
-        def apply(remainingGates: List[Gate]) = new Circuit(remainingGates).deferMeasurements
-    }
-
-    case class MultiDeferredMeasure(q: List[Int]) extends Gate 
-    case class DeferredMeasurement(q: Int) extends Gate 
-
-    site(tp) (
-        go { case r(a) + r(b) ⇒ {
-                logger.debug(s"Possible Reaction between $a and $b"); 
-                if(a.v.sameElements(b.v)){ 
-                    logger.debug("Molecules compatible. Reaction starting")
-                    val newQ = QVec(Complex(a.prop.real + b.prop.real, a.prop.imag + b.prop.imag), a.v)
-                    if(newQ.v(0) && newQ.v(1) && newQ.v(2) && newQ.v(3) && newQ.v(4)){
-                        logger.debug(s"What I need $newQ")
-                    }
-                    if(newQ.prop.abs >= threshold){
-                        if(sampledState.tryRecord(newQ)){
-                            logger.info(s"Threshold $threshold passed: $newQ")
-                            if(!terminateEarly){
-                                scaleAndSample()
-                            }
-                        }
-                        
-                    }else if(newQ.prop.abs == 0.0){
-                        logger.debug("Destrictive Interference")
-                    }else{
-                        logger.debug(s"Reaction finished, releasesing $newQ into the solution")
-                        r(newQ)
-                    }
-                }else{
-                    logger.debug("Incompatible molecules. Returning molecules to the pool")
-                    r(a) + r(b)
-                }
+              }
             }
+          } finally {
+            activityLock.synchronized {
+              interferenceReactionsInFlight -= 1L
+              require(
+                interferenceReactionsInFlight >= 0L,
+                "Endpoint interference in-flight count became negative"
+              )
+              activityLock.notifyAll()
+            }
+          }
+
+          selected.foreach { stateToRecord =>
+            require(
+              sampledState.tryRecord(stateToRecord),
+              "The selected state recorder was already populated"
+            )
+          }
+      }
+    )
+    ()
+  }
+
+  private def acceptTerminal(state: QVec): Unit = {
+    val terminal = terminalState(state)
+    var selected: Option[QVec] = None
+
+    activityLock.synchronized {
+      if (!stopRequested.get()) {
+        generatedTerminalContributions.increment()
+        terminal.foreach { terminalState =>
+          readyTerminalMolecules.increment()
+          val isCorrect = experiment.isCorrectTerminalState(terminalState.v)
+          if (isCorrect) {
+            readyCorrectTerminalMolecules.increment()
+          }
+
+          if (terminalState.prop.abs >= threshold) {
+            stopRequested.set(true)
+            val snapshot =
+              captureActivity(ReadyMolecule(terminalState, isCorrect))
+            selectedActivity.set(snapshot)
+            selected = Some(snapshot.selection.selected.state)
+          } else {
+            emitReadyLocked(terminalState, isCorrect)
+          }
         }
+      }
+    }
+
+    selected match {
+      case Some(stateToRecord) =>
+        require(
+          sampledState.tryRecord(stateToRecord),
+          "The selected state recorder was already populated"
+        )
+      case None => ()
+    }
+  }
+
+  private def terminalState(state: QVec): Option[QVec] =
+    experiment.simonPostSelection match {
+      case Some(selection) =>
+        val measuredOutput = selectedSimonOutput.get
+        if (state.v.takeRight(selection.inputQubits).sameElements(measuredOutput)) {
+          Some(QVec(state.prop, state.v.take(selection.inputQubits)))
+        } else {
+          None
+        }
+      case None =>
+        experiment.resultQubits match {
+          case Some(qubits) =>
+            Some(QVec(state.prop, qubits.map(state.v)))
+          case None =>
+            Some(state)
+        }
+    }
+
+  /** Must be called while holding activityLock. */
+  private def emitReadyLocked(state: QVec, isCorrect: Boolean): Unit = {
+    val molecule = ReadyMolecule(state, isCorrect)
+    readyPoolAmplitudeTracker.emitted(molecule)
+    ready(molecule)
+  }
+
+  private def captureActivity(thresholdTrigger: ReadyMolecule): ActivitySnapshot = {
+    val selection = readyPoolAmplitudeTracker.select(
+      thresholdTrigger,
+      ExperimentConfig.outcomeSelectionMode,
+      outcomeSelectionRandom
+    )
+    ActivitySnapshot(
+      generatedTerminals = generatedTerminalContributions.sum(),
+      interferenceReactions = interferenceReactions.sum(),
+      bActive = readyTerminalMolecules.sum(),
+      bActiveCorrect = readyCorrectTerminalMolecules.sum(),
+      selection = selection
+    )
+  }
+
+  /**
+    * Called only after the FS2 terminal stream has completed normally.
+    *
+    * Molecules already dispatched to a reaction remain in the shadow tracker
+    * until the reaction body starts. Once it starts, the in-flight count keeps
+    * the pool non-quiescent until the combined molecule has been emitted or
+    * discarded. Together, those signals close the gap between consuming a
+    * pair and emitting its result.
+    */
+  private def awaitSampleOrQuiescentFailure(): QVec = {
+    var exhaustedPool = Option.empty[ReadyPoolProgressSnapshot]
+
+    activityLock.synchronized {
+      var progress = readyPoolAmplitudeTracker.progressSnapshot()
+      while (
+        !stopRequested.get() &&
+        (interferenceReactionsInFlight > 0L || progress.hasCompatiblePair)
+      ) {
+        activityLock.wait()
+        progress = readyPoolAmplitudeTracker.progressSnapshot()
+      }
+
+      if (!stopRequested.get()) {
+        exhaustedPool = Some(progress)
+        stopRequested.set(true)
+      }
+    }
+
+    exhaustedPool.foreach { progress =>
+      throw new IllegalStateException(
+        s"FS2 path generation and endpoint interference completed without any " +
+          s"molecule reaching threshold $threshold. The quiescent ready pool " +
+          s"contains ${progress.moleculeCount} molecule(s) across " +
+          s"${progress.distinctEndpointStates} endpoint state(s), with no " +
+          s"compatible pair remaining. This trial cannot satisfy the configured " +
+          s"first-threshold-crossing boundary."
+      )
+    }
+
+    // A reaction can set stopRequested immediately before it records the
+    // selected state. Wait for that short hand-off instead of reporting a
+    // spurious no-threshold failure.
+    sampledState.awaitSample()
+  }
+
+  private def terminateFailedExperiment(error: Throwable): Nothing = {
+    stopRequested.set(true)
+    Console.err.println(s"Experiment ${experiment.alias} failed: ${error.getMessage}")
+    error.printStackTrace(Console.err)
+    endpointPool.shutdownNow()
+    System.exit(1)
+    throw error
+  }
+
+  /**
+    * Split only enough leading work to keep the configured workers busy.
+    * Everything after this bounded frontier remains lazy in FS2.
+    */
+  @tailrec
+  private def buildPartitions(
+      frontier: Vector[PathPartition]
+  ): Vector[PathPartition] = {
+    if (
+      frontier.length >= ExperimentConfig.workerThreads ||
+      frontier.forall(_.remainingGates.isEmpty)
+    ) {
+      frontier
+    } else {
+      val next = frontier.flatMap {
+        case partition @ PathPartition(_, Nil) =>
+          Vector(partition)
+        case PathPartition(state, gate :: remaining) =>
+          applyGate(gate, state).map(nextState => PathPartition(nextState, remaining))
+      }
+      buildPartitions(next)
+    }
+  }
+
+  private def streamPaths(
+      state: QVec,
+      remainingGates: List[Gate]
+  ): Stream[IO, QVec] = {
+    if (stopRequested.get()) {
+      Stream.empty
+    } else {
+      remainingGates match {
+        case Nil =>
+          Stream.emit(state)
+        case gate :: remaining =>
+          Stream
+            .emits(applyGate(gate, state))
+            .covary[IO]
+            .flatMap(nextState => streamPaths(nextState, remaining))
+      }
+    }
+  }
+
+  private def emitTerminal(state: QVec): IO[Unit] = {
+    if (stopRequested.get()) {
+      IO.unit
+    } else {
+      val jitter =
+        if (ExperimentConfig.completionJitterMillis == 0) 0
+        else
+          ThreadLocalRandom
+            .current()
+            .nextInt(ExperimentConfig.completionJitterMillis)
+      val delay = if (jitter == 0) IO.unit else IO.sleep(jitter.millis)
+      delay *> IO(acceptTerminal(state))
+    }
+  }
+
+  private def applyGate(gate: Gate, state: QVec): Vector[QVec] =
+    gate match {
+      case X(target) =>
+        Vector(QVec(state.prop, state.v.updated(target, !state.v(target))))
+
+      case H(target) =>
+        val sign = if (state.v(target)) -1d else 1d
+        Vector(
+          QVec(
+            Complex(sign * hScale * state.prop.real, sign * hScale * state.prop.imag),
+            state.v
+          ),
+          QVec(
+            Complex(hScale * state.prop.real, hScale * state.prop.imag),
+            state.v.updated(target, !state.v(target))
+          )
+        )
+
+      case CX(control, target) =>
+        val nextBits =
+          if (state.v(control)) state.v.updated(target, !state.v(target)) else state.v
+        Vector(QVec(state.prop, nextBits))
+
+      case CCX(control1, control2, target) =>
+        val nextBits =
+          if (state.v(control1) && state.v(control2))
+            state.v.updated(target, !state.v(target))
+          else state.v
+        Vector(QVec(state.prop, nextBits))
+
+      case CZ(control, target) =>
+        val nextAmplitude =
+          if (state.v(control) && state.v(target)) state.prop * -1d else state.prop
+        Vector(QVec(nextAmplitude, state.v))
+
+      case PhaseFlipWhenAllOne(qubits) =>
+        val nextAmplitude =
+          if (qubits.forall(state.v)) state.prop * -1d else state.prop
+        Vector(QVec(nextAmplitude, state.v))
+
+      case Swap(q1, q2) =>
+        val swapped = state.v.updated(q1, state.v(q2)).updated(q2, state.v(q1))
+        Vector(QVec(state.prop, swapped))
+
+      case RZ(thetaDenominator, target) =>
+        Vector(
+          QVec(
+            RotationMath.applyRz(state.prop, thetaDenominator, state.v(target)),
+            state.v
+          )
+        )
+
+      case CRotate(control, thetaDenominator, target) =>
+        Vector(
+          QVec(
+            RotationMath.applyControlledRotate(
+              state.prop,
+              thetaDenominator,
+              state.v(control),
+              state.v(target)
+            ),
+            state.v
+          )
+        )
+
+      case Rotate(thetaDenominator, target) =>
+        Vector(
+          QVec(
+            RotationMath.applyPhase(state.prop, thetaDenominator, state.v(target)),
+            state.v
+          )
+        )
+
+      case ModularExponentiation(base, modulus, inputQubits, outputQubits) =>
+        val exponent = inputQubits.foldLeft(0) { (value, qubit) =>
+          (value << 1) | (if (state.v(qubit)) 1 else 0)
+        }
+        val modularResult =
+          BigInt(base).modPow(BigInt(exponent), BigInt(modulus)).toInt
+        val nextBits = outputQubits.zipWithIndex.foldLeft(state.v) {
+          case (current, (qubit, index)) =>
+            val shift = outputQubits.length - index - 1
+            current.updated(qubit, ((modularResult >> shift) & 1) == 1)
+        }
+        Vector(QVec(state.prop, nextBits))
+
+      case Measure(_) =>
+        throw new UnsupportedOperationException(
+          "Measurements must be represented by an experiment terminal policy"
+        )
+
+      case unsupported =>
+        throw new UnsupportedOperationException(
+          s"${experiment.alias} contains unsupported gate $unsupported"
+        )
+    }
+
+  private def formatPathEstimate(hadamards: Long): String = {
+    val log10 = hadamards * math.log10(2d) + math.log10(instanceCount.toDouble)
+    if (hadamards <= 50) {
+      (BigInt(instanceCount) * (BigInt(1) << hadamards.toInt)).toString
+    } else {
+      f"$instanceCount%,d x 2^$hadamards%,d (approximately 10^$log10%.1f)"
+    }
+  }
+
+  private val correctnessDescription =
+    experiment.shorPostProcessing
+      .map(_.correctnessDescription)
+      .getOrElse(experiment.correctOutcomes.description)
+
+  private val successTarget =
+    experiment.shorPostProcessing
+      .map(_.targetDescription)
+      .getOrElse(experiment.correctOutcomes.renderedStates)
+
+  private def printRunSummary(): Unit = {
+    println(
+      s"""
+         |===================== EXPERIMENT =====================
+         |alias:       ${experiment.alias}
+         |description: ${experiment.description}
+         |backend:     $backendLabel
+         |qubits:      ${experiment.qubitCount}
+         |instances:   $instanceCount
+         |copy source: ${if (ExperimentConfig.instanceCountOverride.isDefined) "override" else "threshold/catalog"}
+         |threshold:   $threshold
+         |selection:   ${ExperimentConfig.outcomeSelectionMode.label}
+         |FS2 jitter:  0-${ExperimentConfig.fs2BranchJitterMillis} ms per bounded branch
+         |Hadamards:   ${experiment.hadamardCount}
+         |path scale:  ${formatPathEstimate(experiment.hadamardCount.toLong)}
+         |B_total:     $bTotal ($bTotalPerCopy per copy)
+         |B_correct:   $bCorrect ($bCorrectPerCopy per copy)
+         |I_full:      ${referenceMetrics.fullInterferenceReactions}
+         |I endpoints: ${referenceMetrics.fullInterferenceEndpointStates}
+         |check bits:  ${experiment.correctOutcomes.observedQubits.mkString(",")}
+         |success:     $successTarget
+         |output:      ${samplePath.toAbsolutePath.normalize}
+         |aliases:     ${ExperimentCatalog.aliases.mkString(", ")}
+         |======================================================""".stripMargin
     )
 
-    def build(c: Circuit, v: QVec)(implicit sampler: Sampler) : IO[Unit] = {
-        c.remainingGates match{ 
-            case Nil => 
-               //for simon 
-               // val midresult = sampler.sample()
-                // if(v.v.takeRight(v.v.length / 2).sameElements(midresult)){
-                //     val newMolecule = QVec(v.prop, v.v.take(v.v.length / 2))
-                //     logger.debug("Releasing " + newMolecule)
-                //     r(newMolecule)
-                // }
-                // val take = 4
-                // val newMolecule = QVec(v.prop, v.v.take(take))
-                //if(!v.v(0) & !v.v(1) & !v.v(2) & !v.v(3)){
-                // logger.info("Releasing " + v)
-                //IO.sleep(FiniteDuration(scala.util.Random.nextInt(40), scala.concurrent.duration.SECONDS)) *> 
-                //IO.pure(r(v))
-                //}
+    selectedSimonOutput.foreach { output =>
+      println(s"Simon post-selected oracle output: ${output.map(if (_) '1' else '0').mkString}")
+    }
+    experiment.paperTerminalContributions.foreach { total =>
+      println(s"Paper terminal-contribution count: $total")
+    }
+    experiment.shorPostProcessing.foreach { _ =>
+      println(s"Reference quantum frequency bins: ${experiment.correctOutcomes.renderedStates}")
+    }
+    println(s"Correctness definition: $correctnessDescription")
+    experiment.notes.foreach(note => println(s"Note: $note"))
+  }
 
-                //for the very large grover with ancillas 
-                logger.debug("Releasing " + QVec(v.prop, v.v.take(5)))
-                // This is needed for the giant grover instance otherwise the pool crashes 
-                IO.sleep(FiniteDuration(scala.util.Random.nextInt(40), scala.concurrent.duration.SECONDS)) *>  IO.pure(r(QVec(v.prop, v.v.take(5))))
-            case x :: xs => 
-                x match {
-                    case X(t) => 
-                        val nv = QVec(v.prop, v.v.updated(t, !v.v(t)))
-                        logger.debug(s"Applied  X: $nv")
-                        build(Circuit(xs), nv)
-                    case H(t) => 
-                        val sign = if (v.v(t)) -1 else 1
-                        val nc1 = Complex(sign * hScale * v.prop.real, sign * hScale * v.prop.imag)
-                        val nc2 = Complex(hScale * v.prop.real, hScale * v.prop.imag) 
-                        val m1 = if(v.v(t)){QVec(nc1, v.v)}else{QVec(nc1, v.v.updated(t, !v.v(t)))}
-                        val m2 = if(v.v(t)){QVec(nc2, v.v.updated(t, !v.v(t)))}else{QVec(nc2, v.v)}
-                        logger.debug(s"Done with H: m1: $m1, m2: $m2")
-                        build(Circuit(xs), m1)
-                        build(Circuit(xs), m2)
-                    case CX(c, t) => 
-                        if(v.v(c)){
-                            logger.debug(s"Done after CX: with ${QVec(v.prop, v.v.updated(t, !(v.v(t))))}")
-                            build(Circuit(xs), QVec(v.prop, v.v.updated(t, !(v.v(t)))))
-                        }else{
-                            logger.debug(s"Done after CX: with ${QVec(v.prop, v.v)}")
-                            build(Circuit(xs), QVec(v.prop, v.v))
-                        }
-                    case CCX(c1, c2, t) => 
-                        if(v.v(c1) && v.v(c2)){
-                            val nc = QVec(v.prop, v.v.updated(t, !(v.v(t))))
-                            logger.debug(s"Done after CCX: with $nc")
-                            build(Circuit(xs), nc)
-                        }else{
-                            logger.debug(s"Done after CCX: with $v")
-                            build(Circuit(xs), v)
-                        }
-                    case Swap(q1, q2) => 
-                         val source = v.v(q1)
-                         val target = v.v(q2)
-                         val firstOverwrite = v.v.updated(q2, source)
-                         val second = firstOverwrite.updated(q1, target)
-                         build(Circuit(xs), QVec(v.prop, second))
-                    case RZ(td, q) =>
-                        val ph = RotationMath.applyRz(v.prop, td, v.v(q))
-                        logger.debug(s"Done after RZ, with ${QVec(ph, v.v)}")
-                        build(Circuit(xs), QVec(ph, v.v))
-                    case Rotate(td, q) =>
-                        val ph = RotationMath.applyPhase(v.prop, td, v.v(q))
-                        logger.debug(s"Done after phase rotation, with ${QVec(ph, v.v)}")
-                        build(Circuit(xs), QVec(ph, v.v))
-                    case CRotate(c, td, q) =>
-                        val ph =
-                            RotationMath.applyControlledRotate(v.prop, td, v.v(c), v.v(q))
-                        logger.debug(s"Done after controlled rotation, with ${QVec(ph, v.v)}")
-                        build(Circuit(xs), QVec(ph, v.v))
-                
-                    case CZ(ctrl, target) =>  
-                        if(v.v(ctrl) && v.v(target)){
-                            build(Circuit(xs), QVec(v.prop * -1, v.v))
-                        }else{
-                            build(Circuit(xs), v)
-                        }
-                    case ModGate(a, n) =>
-                        val rv: Vector[Boolean] = v.v.slice(0, 4)
-                        val relevantbits = rv.map(a => if(a){1}else{0})
-                        val rbstring = relevantbits.mkString("")
-                        val i = Integer.parseInt(rbstring, 2)
-                        val r = Math.floor(Math.pow(a, i) % n).toInt
-                        val l = r.toBinaryString.toList.map(a => if(a == '1'){true}else{false})
-                        build(Circuit(xs), QVec(v.prop, rv ++ l)) 
-                    case Measure(q) => ??? 
-                }
-        }
+  printRunSummary()
+
+  if (ExperimentConfig.preflightOnly) {
+    println("Preflight complete; no path stream or circuit molecules were created.")
+    System.exit(0)
+  }
+
+  reactionSite
+  private val initialPartitions = Vector.fill(instanceCount)(
+    PathPartition(experiment.initialState, experiment.gates)
+  )
+  private val partitions = buildPartitions(initialPartitions)
+  private val branchJitterSchedule = Fs2BranchJitter.schedule(
+    partitions.length,
+    ExperimentConfig.fs2BranchJitterMillis,
+    fs2BranchJitterSeed
+  )
+  private val pathParallelism =
+    math.max(1, math.min(ExperimentConfig.workerThreads, partitions.length))
+  println(
+    s"FS2 path generation: ${partitions.length} bounded partition(s), " +
+      s"parallelism=$pathParallelism, branch jitter " +
+      f"min=${branchJitterSchedule.minimumMillis}ms " +
+      f"max=${branchJitterSchedule.maximumMillis}ms " +
+      f"mean=${branchJitterSchedule.meanMillis}%.2fms " +
+      s"seed=${branchJitterSchedule.seed}"
+  )
+
+  private val terminalStream = Stream
+    .emits(partitions.zip(branchJitterSchedule.delaysMillis).map {
+      case (partition, delayMillis) =>
+        val delay =
+          if (delayMillis == 0) Stream.empty
+          else Stream.eval(IO.sleep(delayMillis.millis)).drain
+        delay ++ streamPaths(partition.state, partition.remainingGates)
+    })
+    .covary[IO]
+    .parJoin(pathParallelism)
+    .parEvalMapUnordered(ExperimentConfig.workerThreads)(emitTerminal)
+
+  private val selected = {
+    val program = for {
+      generationResult <- Deferred[IO, Either[Throwable, Unit]]
+      generationFiber <- terminalStream.compile.drain.attempt
+        .flatMap(result => generationResult.complete(result).void)
+        .start
+      result <- IO
+        .interruptible(sampledState.awaitSample())
+        .race(
+          generationResult.get.flatMap {
+            case Left(error) => IO.raiseError[QVec](error)
+            case Right(_)    => IO.interruptible(awaitSampleOrQuiescentFailure())
+          }
+        )
+        .guarantee(generationFiber.cancel)
+    } yield result.fold(identity, identity)
+
+    program.attempt.unsafeRunSync() match {
+      case Right(sample) => sample
+      case Left(error)   => terminateFailedExperiment(error)
+    }
+  }
+
+  stopRequested.set(true)
+  private val observedOutcome = experiment.correctOutcomes.observe(selected.v)
+  private val observedBits = observedOutcome.map(if (_) '1' else '0').mkString
+  private val shorPostProcessingResult =
+    experiment.shorPostProcessing.map(_.process(observedOutcome))
+  private val isCorrect = shorPostProcessingResult
+    .map(_.success)
+    .getOrElse(experiment.correctOutcomes.states.contains(observedOutcome))
+  private val elapsedMillis = (System.nanoTime() - startedAtNanos) / 1000000L
+  private val activityAtSelection = Option(selectedActivity.get()).getOrElse(
+    throw new IllegalStateException("A sampled state was recorded without an activity snapshot")
+  )
+  private val terminalContributionsAtSelection = activityAtSelection.generatedTerminals
+  private val interferenceReactionsAtSelection = activityAtSelection.interferenceReactions
+  private val developedAmplitudeMagnitude = selected.prop.abs
+  private val selectionDecision = activityAtSelection.selection
+  private val readyPoolAtSelection = selectionDecision.readyPool
+  private val incorrectReadyPoolAtSelection = readyPoolAtSelection.incorrectMolecules
+  private val fullInterferenceReactions = referenceMetrics.fullInterferenceReactions
+  private val interferenceCompletionFraction =
+    if (fullInterferenceReactions == 0) 1d
+    else
+      (BigDecimal(interferenceReactionsAtSelection) /
+        BigDecimal(fullInterferenceReactions)).toDouble
+  private val interferenceReductionFraction = 1d - interferenceCompletionFraction
+  private val idealSampledOutcomeProbability =
+    referenceMetrics.idealProbability(observedOutcome)
+  private val correctnessMetadata =
+    experiment.shorPostProcessing match {
+      case Some(postProcessing) =>
+        Vector(
+          "correctnessMethod" -> "shor-classical-factor-recovery",
+          "correctOutcomeStates" -> "post-processing-dependent",
+          "referenceFrequencyBins" -> experiment.correctOutcomes.renderedStates,
+          "shorMaxIntermediateConvergents" ->
+            postProcessing.maxIntermediateConvergents.toString,
+          "shorMaxDenominatorMultiple" ->
+            postProcessing.maxDenominatorMultiple.toString
+        )
+      case None =>
+        Vector(
+          "correctnessMethod" -> "accepted-state-membership",
+          "correctOutcomeStates" -> experiment.correctOutcomes.renderedStates
+        )
     }
 
- def scaleAndSample() = {
-        println("SCALING........")
-        // terminate.volatileValue
-        logger.debug(r.logSoup)
-        println(r.volatileValue)
-        val x = r.logSoup.split("Molecules:")(1)
-        val each = x.split("terminate/P\\(QVec\\(")
-        val pps = each.map(s => {
-            val r = s.split(",\\)\\) * ")(0)
-            val p = r.split("\\+")(0).drop(1)
-            val v = r.split(",Vector").filter(u => u.contains("true") || u.contains("false"))
-            (p, v.toVector)
-        }).drop(1)
+  sampledState.appendMetadata(
+    Vector(
+      "selectedAtTerminalContributions" -> terminalContributionsAtSelection.toString,
+      "selectedAtInterferenceReactions" -> interferenceReactionsAtSelection.toString,
+      "interferenceReactionsAtSampling" -> interferenceReactionsAtSelection.toString,
+      "interferenceReactionDefinition" ->
+        "completed compatible endpoint combinations; incompatible molecule encounters excluded",
+      "outcomeSelectionBoundary" -> "first state-molecule threshold crossing",
+      "thresholdTriggerBits" ->
+        selectionDecision.thresholdTrigger.state.v.map(if (_) '1' else '0').mkString,
+      "thresholdTriggerAmplitude.real" ->
+        selectionDecision.thresholdTrigger.state.prop.real.toString,
+      "thresholdTriggerAmplitude.imag" ->
+        selectionDecision.thresholdTrigger.state.prop.imag.toString,
+      "thresholdTriggerAmplitude.magnitude" ->
+        selectionDecision.thresholdTrigger.amplitudeMagnitude.toString,
+      "thresholdTriggerWasSelected" ->
+        selectionDecision.thresholdTriggerWasSelected.toString,
+      "samplingPopulationMoleculesAtSampling" ->
+        selectionDecision.samplingPopulationMoleculeCount.toString,
+      "samplingPopulationEndpointStatesAtSampling" ->
+        selectionDecision.samplingPopulationEndpointStateCount.toString,
+      "samplingPopulationAmplitudeSquaredMass" ->
+        selectionDecision.amplitudeSquaredMass.toString,
+      "bornRuleNormalizationFactor" ->
+        selectionDecision.bornRuleNormalizationFactor.toString,
+      "samplingPopulationNormalizedProbabilitySum" ->
+        selectionDecision.normalizedProbabilitySum.toString,
+      "samplingPopulationBornDistribution" ->
+        selectionDecision.renderedNormalizedStateProbabilities,
+      "selectedStateNormalizedBornProbabilityAtSampling" ->
+        selectionDecision.selectedStateNormalizedBornProbability.toString,
+      "bornRuleRandomDraw" ->
+        selectionDecision.bornRuleRandomDraw.map(_.toString).getOrElse("not-used"),
+      "bornRuleRandomSeed" -> bornRuleRandomSeed.toString,
+      "bornRuleProbabilityDefinition" ->
+        ReadyPoolAmplitudeTracker.bornRuleProbabilityDefinition,
+      "I_full" -> fullInterferenceReactions.toString,
+      "I_fullContributions" ->
+        referenceMetrics.fullInterferenceContributions.toString,
+      "I_fullEndpointStates" ->
+        referenceMetrics.fullInterferenceEndpointStates.toString,
+      "I_fullDefinition" -> CircuitReferenceMetrics.fullInterferenceDefinition,
+      "interferenceCompletionFraction" -> interferenceCompletionFraction.toString,
+      "interferenceReductionFraction" -> interferenceReductionFraction.toString,
+      "idealSampledOutcomeProbability" -> idealSampledOutcomeProbability.toString,
+      "idealOutputDistribution" -> referenceMetrics.renderedIdealDistribution,
+      "idealDistributionDefinition" ->
+        CircuitReferenceMetrics.idealDistributionDefinition,
+      "developedAmplitudeMagnitude" -> developedAmplitudeMagnitude.toString,
+      "maxIncorrectReadyAmplitudeAtSampling" ->
+        incorrectReadyPoolAtSelection.maximumAmplitude.toString,
+      "incorrectReadyMoleculesAtSampling" ->
+        incorrectReadyPoolAtSelection.moleculeCount.toString,
+      "maxIncorrectReadyAmplitudeAtSamplingExact" -> "false",
+      "incorrectReadyPoolSnapshotSemantics" ->
+        ReadyPoolAmplitudeTracker.snapshotSemantics,
+      "selectedStateAggregateAmplitude.real" ->
+        readyPoolAtSelection.selectedStateAggregateAmplitude.real.toString,
+      "selectedStateAggregateAmplitude.imag" ->
+        readyPoolAtSelection.selectedStateAggregateAmplitude.imag.toString,
+      "selectedStateAggregateAmplitude.magnitude" ->
+        readyPoolAtSelection.selectedStateAggregateAmplitudeMagnitude.toString,
+      "maxIncorrectReadyStateAggregateAmplitudeAtSampling" ->
+        readyPoolAtSelection.maximumIncorrectReadyStateAggregateAmplitude.toString,
+      "selectedVsMaxIncorrectStateAmplitudeMargin" ->
+        readyPoolAtSelection.selectedVsMaxIncorrectStateAmplitudeMargin.toString,
+      "selectedVsMaxIncorrectStateAmplitudeRatio" ->
+        readyPoolAtSelection.selectedVsMaxIncorrectStateAmplitudeRatio
+          .map(_.toString)
+          .getOrElse("undefined-no-incorrect-ready-state"),
+      "selectedStateAmplitudeRank" ->
+        readyPoolAtSelection.selectedStateAmplitudeRank.toString,
+      "readyMoleculesAtSampling" ->
+        readyPoolAtSelection.readyMoleculeCount.toString,
+      "readyCorrectMoleculesAtSampling" ->
+        readyPoolAtSelection.correctReadyMoleculeCount.toString,
+      "readyIncorrectMoleculesAtSampling" ->
+        readyPoolAtSelection.incorrectReadyMoleculeCount.toString,
+      "distinctReadyEndpointStatesAtSampling" ->
+        readyPoolAtSelection.distinctReadyEndpointStates.toString,
+      "distinctCorrectReadyEndpointStatesAtSampling" ->
+        readyPoolAtSelection.distinctCorrectReadyEndpointStates.toString,
+      "distinctIncorrectReadyEndpointStatesAtSampling" ->
+        readyPoolAtSelection.distinctIncorrectReadyEndpointStates.toString,
+      "readyPoolStateSnapshotExact" -> "false",
+      "readyPoolStateSnapshotSemantics" ->
+        ReadyPoolAmplitudeTracker.snapshotSemantics,
+      "B_total" -> bTotal.toString,
+      "B_correct" -> bCorrect.toString,
+      "B_active" -> activityAtSelection.bActive.toString,
+      "B_activecorrect" -> activityAtSelection.bActiveCorrect.toString,
+      "B_totalPerCopy" -> bTotalPerCopy.toString,
+      "B_correctPerCopy" -> bCorrectPerCopy.toString,
+      "pathPartitions" -> partitions.length.toString,
+      "pathGenerationParallelism" -> pathParallelism.toString,
+      "fs2BranchJitterRealizedMinimumMillis" ->
+        branchJitterSchedule.minimumMillis.toString,
+      "fs2BranchJitterRealizedMaximumMillis" ->
+        branchJitterSchedule.maximumMillis.toString,
+      "fs2BranchJitterRealizedMeanMillis" ->
+        branchJitterSchedule.meanMillis.toString,
+      "observedOutcome" -> observedBits,
+      "isCorrect" -> isCorrect.toString,
+      "correctnessDefinition" -> correctnessDescription,
+      "elapsedMillis" -> elapsedMillis.toString
+    ) ++ selectedSimonOutput
+      .map(output =>
+        "selectedSimonOracleOutput" -> output.map(if (_) '1' else '0').mkString
+      )
+      .toVector ++ correctnessMetadata ++ shorPostProcessingResult.toVector.flatMap(_.metadata)
+  )
 
-        val sqred = pps.map(x => (x._1.toDouble * x._1.toDouble, x._2)).toList
-        val tot = sqred.foldLeft(0d)((a, b) => a + b._1)
-        val scale = 1 / tot
-        val scaled = pps.map(x => {
-            val castToBool = x._2.map(b => b == "true")
-            (x._1.toDouble * scale, castToBool)
-        })
-        println("pps+----")
-        scaled.foreach(println)
-        val res = new BasicSampler(scaled.toList).sample()
-        println("------------- RESULT -----------")
-        println(pps)
-        println(res)
+  shorPostProcessingResult.foreach { result =>
+    val postProcessing = experiment.shorPostProcessing.get
+    result.printReport(postProcessing.modulus, postProcessing.base)
+  }
+  println(
+    s"""
+       |=================== OUTCOME CHECK ====================
+       |observed:       $observedBits
+       |correct:        ${if (isCorrect) "YES" else "NO"}
+       |selection mode: ${ExperimentConfig.outcomeSelectionMode.label}
+       |trigger:        ${selectionDecision.thresholdTrigger.state.v.map(if (_) '1' else '0').mkString}
+       |developed amp:  $developedAmplitudeMagnitude
+       |state agg amp:  ${readyPoolAtSelection.selectedStateAggregateAmplitudeMagnitude}
+       |max wrong state:${readyPoolAtSelection.maximumIncorrectReadyStateAggregateAmplitude}
+       |state rank:     ${readyPoolAtSelection.selectedStateAmplitudeRank}
+       |interference:   $interferenceReactionsAtSelection / $fullInterferenceReactions
+       |I reduction:    $interferenceReductionFraction
+       |distribution p: $idealSampledOutcomeProbability
+       |partial mass:   ${selectionDecision.amplitudeSquaredMass}
+       |partial p:      ${selectionDecision.selectedStateNormalizedBornProbability}
+       |ready soup:     ${readyPoolAtSelection.readyMoleculeCount} molecule(s), ${readyPoolAtSelection.distinctReadyEndpointStates} state(s)
+       |B_total:        $bTotal
+       |B_correct:      $bCorrect
+       |B_active:       ${activityAtSelection.bActive}
+       |B_activecorrect:${activityAtSelection.bActiveCorrect}
+       |success target: $successTarget
+       |definition:     $correctnessDescription
+       |======================================================""".stripMargin
+  )
+  println(
+    s"Run complete: sampled ${selected.v.map(if (_) '1' else '0').mkString}; " +
+      s"generated terminals=$terminalContributionsAtSelection, " +
+      s"interference reactions=$interferenceReactionsAtSelection, elapsed=${elapsedMillis}ms"
+  )
+
+  if (ExperimentConfig.terminateAfterSample) {
+    if (ExperimentConfig.shutdownDrainMillis > 0) {
+      Thread.sleep(ExperimentConfig.shutdownDrainMillis.toLong)
     }
-
-    // Example Simon Circuit
-    val fourbitsimon = Circuit(List(H(0), H(1), CX(0, 2), CX(0, 3), CX(1, 2), CX(1, 3), H(0), H(1)))
-    implicit val sampler = new FakeSimonSampler(fourbitsimon)
-    val excs = QVec(1d, Vector(false, false, false, false))
-    // Stream.eval(IO{build(fourbitsimon, excs)}).repeatN(concurrentInstances).compile.toVector.unsafeRunSync()
-
-
-    //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    // Example Shor Circuit
-    //implicit val sampler = new FakeShorSampler()
-    val _15bitshor = QVec(1d, Vector(false, false, false ,false ,false, false, false, false)) 
-    val n15shor = Circuit(List(H(0), H(1), H(2), H(3), X(0), X(1), X(2), X(3), 
-    ModGate(2, 15), 
-    H(0), CRotate(0, -2, 1), Swap(0, 1), CRotate(1, -4, 2), Swap(1, 2),
-    H(1), CRotate(2, -8, 3), Swap(2, 3), CRotate(1, -2, 2), Swap(1, 2), CRotate(2, -4, 3),
-    Swap(2, 3), H(2), CRotate(2, -2, 3), Swap(2, 3), H(3)
-    ))
-
-    val _shor21 = QVec(1d, Vector(false, false, false, false, false, false, false, false))
-    val n21shor = Circuit(List(H(0), H(1), H(2), CX(1, 5), H(3), CX(1, 7), CX(2, 5), CX(0, 7),
-    CX(5, 3), RZ(-4, 3), CX(7, 3), RZ(4, 3), CX(5, 3), RZ(-4, 3), RZ(4, 5), CX(7, 3), CX(7, 5), RZ(4, 3), RZ(-4, 5), RZ(4, 7), 
-    H(3), CX(7, 5), CX(0, 7), CX(1, 7), H(7), CX(3, 7), RZ(-4, 7), CX(0, 7), RZ(4,7), CX(3, 7), 
-    RZ(4, 3), RZ(-4, 7), CX(0, 7), CX(0, 3), RZ(4, 7), RZ(4, 0), RZ(-4, 3), H(7), CX(0, 3), CX(3, 5), CX(7, 5), CX(0, 5), X(7), CX(2, 7), CX(1, 7), CX(0, 7),
-    CX(0, 2), CX(2, 0), CX(0, 2), H(0), RZ(-4, 0), CX(0, 1), RZ(4, 1), CX(0, 1), RZ(-8, 0), RZ(-4, 1), CX(0, 2), H(1), RZ(8, 2), RZ(-4, 1), CX(0,2),
-    RZ(-8, 2), CX(1, 2), RZ(4, 2), CX(1, 2), RZ(-4, 2), H(2)))
-
-    //%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    //Example Grover Circuit 
-    val _g0000 = QVec(1d, Vector(false, false, false, false))
-    val grover0000 = Circuit(List(
-        H(0), H(1), H(2), H(3),
-        X(0), X(1), X(2), X(3),
-        CRotate(0, 2, 3), CX(0, 1), CRotate(1, -2, 3), CX(0, 1), CRotate(1, 2, 3), CX(1, 2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3), CX(1, 2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3),
-        X(1), X(0), X(2), X(3), H(0), H(1), H(2), H(3), //r2
-        X(1), X(0), X(2), X(3),
-        CRotate(0, 2, 3), CX(0, 1), CRotate(1, -2, 3), CX(0, 1), CRotate(1, 2, 3), CX(1,2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3), CX(1, 2), CRotate(2, -2, 3), CX(0, 2), CRotate(2, 2, 3),
-        X(1), X(0), X(2), X(3), H(0), H(1), H(2), H(3)))
-
-
-    // Stream.eval(IO{build(grover0000, _g0000)}).compile.toVector.unsafeRunSync()
-
-    val groverSAT011 = Circuit(List(H(0), H(1), H(2), X(2), CX(1, 2), Rotate(-4, 2), CX(0, 2), Rotate(4, 2), CX(1, 2),
-    Rotate(4, 1), Rotate(-4, 2), CX(0, 2), CX(0, 1), Rotate(4, 2), CX(0,1), Rotate(4, 2), Rotate(4, 0), Rotate(-4, 1), X(2), CX(0,1),
-    H(0), H(1), H(2), X(0), X(1), X(2),
-    CX(1,2), Rotate(-4, 2), CX(0,2), Rotate(4, 2), CX(1, 2), Rotate(4, 1), Rotate(-4, 2), CX(0, 2), CX(0, 1), 
-    Rotate(4, 0), Rotate(-4, 1), Rotate(4, 1), X(2), H(2), CX(0, 1), X(0), X(1), X(2), H(0), H(1),
-    CX(1, 2), Rotate(-4, 2), CX(0, 2), Rotate(4, 2), CX(1,2), Rotate(4, 1), Rotate(-4, 2), CX(0, 2), CX(0, 1), 
-    Rotate(4, 0), Rotate(-4, 1), Rotate(4, 2), X(0), CX(0, 1),
-    H(0), H(1), H(2), X(0), X(1), X(2), H(0), H(1), H(2)))
-
-    val _gSAT001 = QVec(1d, Vector(false, false, false))
-
-    val gSAT111 = Circuit(List(H(0), H(1), H(2),
-     H(2), CCX(0, 1, 2), H(2), 
-     H(0), H(1), H(2), X(0), X(1), X(2), H(2), CCX(0, 1, 2), H(2), X(0), X(1), X(2), H(0), H(1), H(2), //r1
-     //H(0), H(1), H(2), X(0), X(1), X(2), H(2), CCX(0, 1, 2), H(2), X(0), X(1), X(2), H(0), H(1), H(2), 
-    ))
-
-    val _gSAT111 = QVec(1d, Vector(false, false, false))
-    // Stream.eval(build(gSAT111, _gSAT111)).compile.toVector.unsafeRunSync()
-
-
-    //Requires 40GB+ memory to run!!! run at your own risk 
-    val g511111 = Circuit(List(H(0), H(1), H(2), H(3), H(4),
-        CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        H(0), H(1), H(2), H(3), H(4), X(0), X(1), X(2), X(3), X(4), 
-        CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        X(0), X(1), X(2), X(3), X(4), H(0), H(1), H(2), H(3), H(4), //r1 
-         CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        H(0), H(1), H(2), H(3), H(4), X(0), X(1), X(2), X(3), X(4), 
-        CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        X(0), X(1), X(2), X(3), X(4), H(0), H(1), H(2), H(3), H(4), //r2
-        // CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        // H(0), H(1), H(2), H(3), H(4), X(0), X(1), X(2), X(3), X(4), 
-        // CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        // X(0), X(1), X(2), X(3), X(4), H(0), H(1), H(2), H(3), H(4) //r3
-        //,CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        // H(0), H(1), H(2), H(3), H(4), X(0), X(1), X(2), X(3), X(4), 
-        // CCX(0, 1, 5), CCX(1, 2, 6), CCX(5, 6, 7), CZ(7, 4), CCX(5, 6, 7), CCX(1, 2, 6), CCX(0, 1, 5),
-        // X(0), X(1), X(2), X(3), X(4), H(0), H(1), H(2), H(3), H(4), //r4
-    ))
-
-     val _g511111 = QVec(1d, Vector(false, false, false, false, false, false, false ,false))
-     Stream.eval(build(g511111, _g511111)).compile.toVector.unsafeRunSync()
-     sampledState.awaitSample()
-     if(terminateEarly){
-         tp.shutdownNow()
-     }
+    endpointPool.shutdownNow()
+    System.exit(0)
+  }
 }

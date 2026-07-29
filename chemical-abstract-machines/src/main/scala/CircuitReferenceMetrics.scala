@@ -1,0 +1,247 @@
+package com.sinanspd
+
+import com.sinanspd.qure.circuit.gates._
+import spire.implicits._
+import spire.math.Complex
+
+import scala.collection.mutable
+
+/**
+  * Deterministic full-simulation references for one experiment configuration.
+  *
+  * `fullInterferenceReactions` is the canonical number of compatible binary
+  * additions needed to reduce every admitted endpoint's path contributions:
+  *
+  *   sum_s (B_s - 1)
+  *
+  * It is independent of CHAM scheduling and of whether an intermediate
+  * addition happens to cancel to zero.
+  */
+final case class CircuitReferenceMetrics(
+    fullInterferenceContributions: BigInt,
+    fullInterferenceEndpointStates: Int,
+    fullInterferenceReactions: BigInt,
+    idealOutputProbabilities: Map[Vector[Boolean], Double]
+) {
+  require(fullInterferenceContributions > 0, "A reference run must admit a contribution")
+  require(fullInterferenceEndpointStates > 0, "A reference run must contain an endpoint")
+  require(fullInterferenceReactions >= 0, "Full interference work cannot be negative")
+  require(idealOutputProbabilities.nonEmpty, "The ideal output distribution cannot be empty")
+
+  def idealProbability(outcome: Vector[Boolean]): Double =
+    idealOutputProbabilities.getOrElse(outcome, 0d)
+
+  def renderedIdealDistribution: String =
+    idealOutputProbabilities.toVector
+      .sortBy { case (state, _) => renderBits(state) }
+      .map {
+        case (state, probability) =>
+          s"${renderBits(state)}:${java.lang.Double.toString(probability)}"
+      }
+      .mkString("|")
+
+  private def renderBits(state: Vector[Boolean]): String =
+    state.map(if (_) '1' else '0').mkString
+}
+
+object CircuitReferenceMetrics {
+  val fullInterferenceDefinition: String =
+    "canonical compatible binary additions sum_s(B_s-1) over terminal-policy-admitted endpoint contributions"
+
+  val idealDistributionDefinition: String =
+    "normalized exact full-state Born probabilities after terminal post-selection and observed-register marginalization"
+
+  private final case class StateCell(pathCount: BigInt, amplitude: Complex[Double])
+
+  def calculate(
+      experiment: ExperimentSpec,
+      selectedSimonOutput: Option[Vector[Boolean]],
+      instanceCount: Int
+  ): CircuitReferenceMetrics = {
+    require(instanceCount > 0, "Reference metrics require at least one circuit instance")
+    require(
+      experiment.simonPostSelection.isDefined == selectedSimonOutput.isDefined,
+      s"${experiment.alias} requires exactly one Simon post-selection choice when configured"
+    )
+
+    val fullStates = experiment.gates.foldLeft(
+      Map(experiment.initialState.v -> StateCell(BigInt(1), experiment.initialState.prop))
+    ) {
+      case (states, gate) => applyGate(states, gate)
+    }
+
+    val endpointCounts = mutable.Map.empty[Vector[Boolean], BigInt].withDefaultValue(BigInt(0))
+    val outcomeWeights = mutable.Map.empty[Vector[Boolean], Double].withDefaultValue(0d)
+
+    fullStates.foreach {
+      case (fullState, cell) =>
+        terminalEndpoint(experiment, selectedSimonOutput, fullState).foreach { endpoint =>
+          endpointCounts.update(endpoint, endpointCounts(endpoint) + cell.pathCount)
+          val observed = experiment.correctOutcomes.observe(endpoint)
+          val probabilityWeight =
+            cell.amplitude.real * cell.amplitude.real +
+              cell.amplitude.imag * cell.amplitude.imag
+          outcomeWeights.update(observed, outcomeWeights(observed) + probabilityWeight)
+        }
+    }
+
+    require(
+      endpointCounts.nonEmpty,
+      s"${experiment.alias} terminal policy rejected every exact terminal state"
+    )
+    val normalization = outcomeWeights.values.sum
+    require(
+      normalization > 0d && java.lang.Double.isFinite(normalization),
+      s"${experiment.alias} has an invalid ideal-distribution normalization $normalization"
+    )
+
+    val copies = BigInt(instanceCount)
+    val contributionCounts = endpointCounts.values.map(_ * copies).toVector
+    val contributions = contributionCounts.foldLeft(BigInt(0))(_ + _)
+    val reactions =
+      contributionCounts.foldLeft(BigInt(0))((sum, count) => sum + count - 1)
+    val probabilities =
+      outcomeWeights.iterator.map {
+        case (outcome, weight) => outcome -> (weight / normalization)
+      }.toMap
+
+    CircuitReferenceMetrics(
+      fullInterferenceContributions = contributions,
+      fullInterferenceEndpointStates = endpointCounts.size,
+      fullInterferenceReactions = reactions,
+      idealOutputProbabilities = probabilities
+    )
+  }
+
+  private def terminalEndpoint(
+      experiment: ExperimentSpec,
+      selectedSimonOutput: Option[Vector[Boolean]],
+      fullState: Vector[Boolean]
+  ): Option[Vector[Boolean]] =
+    experiment.simonPostSelection match {
+      case Some(selection) =>
+        if (fullState.takeRight(selection.inputQubits) == selectedSimonOutput.get)
+          Some(fullState.take(selection.inputQubits))
+        else None
+      case None =>
+        Some(experiment.resultQubits.map(_.map(fullState)).getOrElse(fullState))
+    }
+
+  private def applyGate(
+      states: Map[Vector[Boolean], StateCell],
+      gate: Gate
+  ): Map[Vector[Boolean], StateCell] = {
+    val output = mutable.Map.empty[Vector[Boolean], StateCell]
+    val hScale = 1d / math.sqrt(2d)
+
+    def release(
+        state: Vector[Boolean],
+        pathCount: BigInt,
+        amplitude: Complex[Double]
+    ): Unit =
+      output.get(state) match {
+        case Some(previous) =>
+          output.update(
+            state,
+            StateCell(previous.pathCount + pathCount, previous.amplitude + amplitude)
+          )
+        case None =>
+          output.update(state, StateCell(pathCount, amplitude))
+      }
+
+    states.foreach {
+      case (state, cell) =>
+        gate match {
+          case H(target) =>
+            val sign = if (state(target)) -1d else 1d
+            release(state, cell.pathCount, cell.amplitude * (sign * hScale))
+            release(
+              state.updated(target, !state(target)),
+              cell.pathCount,
+              cell.amplitude * hScale
+            )
+
+          case X(target) =>
+            release(state.updated(target, !state(target)), cell.pathCount, cell.amplitude)
+
+          case CX(control, target) =>
+            val next =
+              if (state(control)) state.updated(target, !state(target)) else state
+            release(next, cell.pathCount, cell.amplitude)
+
+          case CCX(control1, control2, target) =>
+            val next =
+              if (state(control1) && state(control2))
+                state.updated(target, !state(target))
+              else state
+            release(next, cell.pathCount, cell.amplitude)
+
+          case CZ(control, target) =>
+            val nextAmplitude =
+              if (state(control) && state(target)) cell.amplitude * -1d
+              else cell.amplitude
+            release(state, cell.pathCount, nextAmplitude)
+
+          case PhaseFlipWhenAllOne(qubits) =>
+            val nextAmplitude =
+              if (qubits.forall(state)) cell.amplitude * -1d else cell.amplitude
+            release(state, cell.pathCount, nextAmplitude)
+
+          case Swap(q1, q2) =>
+            val next = state.updated(q1, state(q2)).updated(q2, state(q1))
+            release(next, cell.pathCount, cell.amplitude)
+
+          case RZ(thetaDenominator, target) =>
+            release(
+              state,
+              cell.pathCount,
+              RotationMath.applyRz(cell.amplitude, thetaDenominator, state(target))
+            )
+
+          case CRotate(control, thetaDenominator, target) =>
+            release(
+              state,
+              cell.pathCount,
+              RotationMath.applyControlledRotate(
+                cell.amplitude,
+                thetaDenominator,
+                state(control),
+                state(target)
+              )
+            )
+
+          case Rotate(thetaDenominator, target) =>
+            release(
+              state,
+              cell.pathCount,
+              RotationMath.applyPhase(cell.amplitude, thetaDenominator, state(target))
+            )
+
+          case ModularExponentiation(base, modulus, inputQubits, outputQubits) =>
+            val exponent = inputQubits.foldLeft(0) { (value, qubit) =>
+              (value << 1) | (if (state(qubit)) 1 else 0)
+            }
+            val modularResult =
+              BigInt(base).modPow(BigInt(exponent), BigInt(modulus)).toInt
+            val next = outputQubits.zipWithIndex.foldLeft(state) {
+              case (current, (qubit, index)) =>
+                val shift = outputQubits.length - index - 1
+                current.updated(qubit, ((modularResult >> shift) & 1) == 1)
+            }
+            release(next, cell.pathCount, cell.amplitude)
+
+          case Measure(_) =>
+            throw new UnsupportedOperationException(
+              "Reference metrics require measurements to be represented by a terminal policy"
+            )
+
+          case unsupported =>
+            throw new UnsupportedOperationException(
+              s"Reference metrics do not support gate $unsupported"
+            )
+        }
+    }
+
+    output.toMap
+  }
+}

@@ -4,6 +4,8 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 import java.time.format.DateTimeFormatter
 import java.time.{Instant, ZoneOffset}
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.Try
@@ -22,6 +24,8 @@ object RepeatedExperimentRunner extends App {
       exitCode: Int,
       values: Map[String, String]
   ) {
+    def succeeded: Boolean =
+      exitCode == 0 && values.get("failureReason").forall(_.isEmpty)
     def number(key: String): Option[Double] = values.get(key).flatMap(value => Try(value.toDouble).toOption)
     def boolean(key: String): Option[Boolean] = values.get(key).flatMap {
       case "true"  => Some(true)
@@ -30,6 +34,8 @@ object RepeatedExperimentRunner extends App {
     }
   }
 
+  private final case class ChildProcessResult(exitCode: Int, failureReason: String)
+
   private val trialCount = ExperimentConfig.repeatedTrialCount
   private val thresholds = ExperimentConfig.repeatedTrialThresholds.distinct
   require(trialCount > 0, "repeatedTrialCount must be positive")
@@ -37,6 +43,14 @@ object RepeatedExperimentRunner extends App {
   require(
     ExperimentConfig.repeatedTrialJvmMaxHeap.matches("[1-9][0-9]*[kKmMgG]?"),
     "repeatedTrialJvmMaxHeap must look like 32G or 4096M"
+  )
+  require(
+    ExperimentConfig.repeatedTrialTimeoutMinutes > 0L,
+    "repeatedTrialTimeoutMinutes must be positive"
+  )
+  require(
+    ExperimentConfig.distributionBootstrapReplicates > 0,
+    "distributionBootstrapReplicates must be positive"
   )
 
   if (trialCount < 50) {
@@ -65,11 +79,22 @@ object RepeatedExperimentRunner extends App {
     Paths.get(System.getProperty("java.home"), "bin", "java").toAbsolutePath.normalize.toString
   private val classpath = System.getProperty("java.class.path")
   private val records = mutable.ArrayBuffer.empty[TrialRecord]
+  private val activeChild = new AtomicReference[Process]()
+  Runtime.getRuntime.addShutdownHook(
+    new Thread(
+      new Runnable {
+        override def run(): Unit =
+          Option(activeChild.getAndSet(null)).foreach(terminateChild)
+      },
+      "repeated-experiment-child-cleanup"
+    )
+  )
 
   println(
     s"Starting $trialCount fresh-JVM trial(s) for ${ExperimentConfig.circuitAlias} " +
       s"at threshold(s) ${thresholds.mkString(", ")}"
   )
+  println(s"Trial backend: ${ExperimentConfig.repeatedTrialBackend.label}")
   println(s"Batch directory: $batchDirectory")
 
   thresholds.foreach { threshold =>
@@ -93,13 +118,19 @@ object RepeatedExperimentRunner extends App {
         s"-D${TrialProcessProtocol.sampleFileProperty}=${sampleFile.toAbsolutePath.normalize}",
         "-cp",
         classpath,
-        "com.sinanspd.Cham2"
+        ExperimentConfig.repeatedTrialBackend.mainClass
       )
 
       val processBuilder = new ProcessBuilder(command: _*)
       processBuilder.redirectErrorStream(true)
       processBuilder.redirectOutput(logFile.toFile)
-      val exitCode = processBuilder.start().waitFor()
+      println(
+        f"starting threshold=$threshold%.6g trial=$trialIndex%4d/$trialCount " +
+          s"log=${logFile.toAbsolutePath.normalize}"
+      )
+      Console.out.flush()
+      val childResult = runChild(processBuilder, logFile)
+      val exitCode = childResult.exitCode
       val resultValues =
         if (Files.exists(sampleFile)) parseKeyValueFile(sampleFile) else Map.empty[String, String]
       val enriched = enrichResult(
@@ -108,6 +139,7 @@ object RepeatedExperimentRunner extends App {
         trialIndex = trialIndex,
         trialSeed = trialSeed,
         exitCode = exitCode,
+        childFailureReason = childResult.failureReason,
         sampleFile = sampleFile,
         logFile = logFile
       )
@@ -134,10 +166,18 @@ object RepeatedExperimentRunner extends App {
     "qubits",
     "backend",
     "randomSeed",
+    "outcomeSelectionMode",
+    "outcomeSelectionBoundary",
     "bits",
     "observedOutcome",
     "amplitude.real",
     "amplitude.imag",
+    "amplitude.magnitude",
+    "developedAmplitudeMagnitude",
+    "maxIncorrectReadyAmplitudeAtSampling",
+    "incorrectReadyMoleculesAtSampling",
+    "maxIncorrectReadyAmplitudeAtSamplingExact",
+    "incorrectReadyPoolSnapshotSemantics",
     "isCorrect",
     "correctnessMethod",
     "B_total",
@@ -152,6 +192,55 @@ object RepeatedExperimentRunner extends App {
     "B_reductionFraction",
     "selectedAtTerminalContributions",
     "selectedAtInterferenceReactions",
+    "interferenceReactionsAtSampling",
+    "interferenceReactionDefinition",
+    "thresholdTriggerBits",
+    "thresholdTriggerAmplitude.real",
+    "thresholdTriggerAmplitude.imag",
+    "thresholdTriggerAmplitude.magnitude",
+    "thresholdTriggerWasSelected",
+    "samplingPopulationMoleculesAtSampling",
+    "samplingPopulationEndpointStatesAtSampling",
+    "samplingPopulationAmplitudeSquaredMass",
+    "bornRuleNormalizationFactor",
+    "samplingPopulationNormalizedProbabilitySum",
+    "samplingPopulationBornDistribution",
+    "selectedStateNormalizedBornProbabilityAtSampling",
+    "bornRuleRandomDraw",
+    "bornRuleRandomSeed",
+    "bornRuleProbabilityDefinition",
+    "I_full",
+    "I_fullContributions",
+    "I_fullEndpointStates",
+    "I_fullDefinition",
+    "interferenceCompletionFraction",
+    "interferenceReductionFraction",
+    "idealSampledOutcomeProbability",
+    "idealOutputDistribution",
+    "idealDistributionDefinition",
+    "selectedSimonOracleOutput",
+    "selectedStateAggregateAmplitude.real",
+    "selectedStateAggregateAmplitude.imag",
+    "selectedStateAggregateAmplitude.magnitude",
+    "maxIncorrectReadyStateAggregateAmplitudeAtSampling",
+    "selectedVsMaxIncorrectStateAmplitudeMargin",
+    "selectedVsMaxIncorrectStateAmplitudeRatio",
+    "selectedStateAmplitudeRank",
+    "readyMoleculesAtSampling",
+    "readyCorrectMoleculesAtSampling",
+    "readyIncorrectMoleculesAtSampling",
+    "distinctReadyEndpointStatesAtSampling",
+    "distinctCorrectReadyEndpointStatesAtSampling",
+    "distinctIncorrectReadyEndpointStatesAtSampling",
+    "readyPoolStateSnapshotExact",
+    "readyPoolStateSnapshotSemantics",
+    "pathPartitions",
+    "pathGenerationParallelism",
+    "fs2BranchJitterMillis",
+    "fs2BranchJitterSeed",
+    "fs2BranchJitterRealizedMinimumMillis",
+    "fs2BranchJitterRealizedMaximumMillis",
+    "fs2BranchJitterRealizedMeanMillis",
     "elapsedMillis",
     "shorPhaseEstimate",
     "shorRationalCandidates",
@@ -170,9 +259,11 @@ object RepeatedExperimentRunner extends App {
   )
 
   private val validRecords =
-    records.toVector.filter(record => record.exitCode == 0 && record.boolean("isCorrect").isDefined)
+    records.toVector.filter(record => record.succeeded && record.boolean("isCorrect").isDefined)
+  private val binaryMetrics = Set("isCorrect", "thresholdTriggerWasSelected")
   private val numericMetrics = Vector(
     "isCorrect",
+    "thresholdTriggerWasSelected",
     "B_total",
     "B_correct",
     "B_active",
@@ -181,15 +272,45 @@ object RepeatedExperimentRunner extends App {
     "B_activeCorrectFraction",
     "B_correctAmongActiveFraction",
     "B_reductionFraction",
+    "developedAmplitudeMagnitude",
+    "maxIncorrectReadyAmplitudeAtSampling",
+    "incorrectReadyMoleculesAtSampling",
     "selectedAtTerminalContributions",
-    "selectedAtInterferenceReactions",
+    "interferenceReactionsAtSampling",
+    "thresholdTriggerAmplitude.magnitude",
+    "samplingPopulationMoleculesAtSampling",
+    "samplingPopulationEndpointStatesAtSampling",
+    "samplingPopulationAmplitudeSquaredMass",
+    "bornRuleNormalizationFactor",
+    "samplingPopulationNormalizedProbabilitySum",
+    "selectedStateNormalizedBornProbabilityAtSampling",
+    "I_full",
+    "I_fullContributions",
+    "I_fullEndpointStates",
+    "interferenceCompletionFraction",
+    "interferenceReductionFraction",
+    "idealSampledOutcomeProbability",
+    "selectedStateAggregateAmplitude.magnitude",
+    "maxIncorrectReadyStateAggregateAmplitudeAtSampling",
+    "selectedVsMaxIncorrectStateAmplitudeMargin",
+    "selectedVsMaxIncorrectStateAmplitudeRatio",
+    "selectedStateAmplitudeRank",
+    "readyMoleculesAtSampling",
+    "readyCorrectMoleculesAtSampling",
+    "readyIncorrectMoleculesAtSampling",
+    "distinctReadyEndpointStatesAtSampling",
+    "distinctCorrectReadyEndpointStatesAtSampling",
+    "distinctIncorrectReadyEndpointStatesAtSampling",
+    "fs2BranchJitterRealizedMinimumMillis",
+    "fs2BranchJitterRealizedMaximumMillis",
+    "fs2BranchJitterRealizedMeanMillis",
     "elapsedMillis"
   )
   private val summaryRows = thresholds.flatMap { threshold =>
     val group = validRecords.filter(_.threshold == threshold)
     numericMetrics.flatMap { metric =>
       val values =
-        if (metric == "isCorrect") {
+        if (binaryMetrics.contains(metric)) {
           group.flatMap(_.boolean(metric).map(if (_) 1d else 0d))
         } else {
           group.flatMap(_.number(metric))
@@ -197,7 +318,8 @@ object RepeatedExperimentRunner extends App {
       if (values.isEmpty) {
         None
       } else {
-        val summary = TrialStatistics.summarize(values, proportion = metric == "isCorrect")
+        val summary =
+          TrialStatistics.summarize(values, proportion = binaryMetrics.contains(metric))
         Some(
           Map(
             "experiment" -> ExperimentConfig.circuitAlias,
@@ -230,6 +352,123 @@ object RepeatedExperimentRunner extends App {
   )
   writeCsv(batchDirectory.resolve("summary.csv"), summaryColumns, summaryRows)
 
+  private val distributionObservations = thresholds.map { threshold =>
+    val observations = validRecords
+      .filter(_.threshold == threshold)
+      .flatMap { record =>
+        for {
+          outcome <- record.values.get("observedOutcome").filter(_.nonEmpty)
+          rendered <- record.values.get("idealOutputDistribution").filter(_.nonEmpty)
+          ideal <- Try(OutputDistributionMetrics.parse(rendered)).toOption
+          if ideal.nonEmpty
+        } yield outcome -> ideal
+      }
+    threshold -> observations
+  }.toMap
+
+  private val distributionQualityRows = thresholds.flatMap { threshold =>
+    val observations = distributionObservations.getOrElse(threshold, Vector.empty)
+    if (observations.isEmpty) {
+      None
+    } else {
+      val empirical = OutputDistributionMetrics.empirical(observations.map(_._1))
+      val ideal = OutputDistributionMetrics.average(observations.map(_._2))
+      val distance = OutputDistributionMetrics.distance(empirical, ideal)
+      val bootstrap = OutputDistributionMetrics.bootstrap(
+        observations,
+        ExperimentConfig.distributionBootstrapReplicates,
+        ExperimentConfig.randomSeed ^ java.lang.Double.doubleToLongBits(threshold)
+      )
+      Some(
+        Map(
+          "experiment" -> ExperimentConfig.circuitAlias,
+          "threshold" -> threshold.toString,
+          "n" -> observations.length.toString,
+          "totalVariationDistance" -> distance.totalVariationDistance.toString,
+          "tvdBootstrapStandardDeviation" ->
+            bootstrap.totalVariation.standardDeviation.toString,
+          "tvdBootstrapConfidenceLow95" ->
+            bootstrap.totalVariation.confidenceLow95.toString,
+          "tvdBootstrapConfidenceHigh95" ->
+            bootstrap.totalVariation.confidenceHigh95.toString,
+          "hellingerDistance" -> distance.hellingerDistance.toString,
+          "hellingerFidelity" -> distance.hellingerFidelity.toString,
+          "hellingerBootstrapStandardDeviation" ->
+            bootstrap.hellinger.standardDeviation.toString,
+          "hellingerBootstrapConfidenceLow95" ->
+            bootstrap.hellinger.confidenceLow95.toString,
+          "hellingerBootstrapConfidenceHigh95" ->
+            bootstrap.hellinger.confidenceHigh95.toString,
+          "bootstrapReplicates" -> bootstrap.replicates.toString,
+          "referenceDistribution" ->
+            renderDistribution(ideal),
+          "definition" ->
+            "empirical sampled-output distribution versus the mean trial-specific exact ideal distribution"
+        )
+      )
+    }
+  }
+  private val distributionQualityColumns = Vector(
+    "experiment",
+    "threshold",
+    "n",
+    "totalVariationDistance",
+    "tvdBootstrapStandardDeviation",
+    "tvdBootstrapConfidenceLow95",
+    "tvdBootstrapConfidenceHigh95",
+    "hellingerDistance",
+    "hellingerFidelity",
+    "hellingerBootstrapStandardDeviation",
+    "hellingerBootstrapConfidenceLow95",
+    "hellingerBootstrapConfidenceHigh95",
+    "bootstrapReplicates",
+    "referenceDistribution",
+    "definition"
+  )
+  writeCsv(
+    batchDirectory.resolve("distribution-quality.csv"),
+    distributionQualityColumns,
+    distributionQualityRows
+  )
+
+  private val distributionDetailRows = thresholds.flatMap { threshold =>
+    val observations = distributionObservations.getOrElse(threshold, Vector.empty)
+    if (observations.isEmpty) {
+      Vector.empty
+    } else {
+      val empirical = OutputDistributionMetrics.empirical(observations.map(_._1))
+      val ideal = OutputDistributionMetrics.average(observations.map(_._2))
+      val observedCounts = observations.map(_._1).groupBy(identity).map {
+        case (outcome, values) => outcome -> values.length
+      }
+      (empirical.keySet ++ ideal.keySet).toVector.sorted.map { outcome =>
+        Map(
+          "experiment" -> ExperimentConfig.circuitAlias,
+          "threshold" -> threshold.toString,
+          "outcome" -> outcome,
+          "observedCount" -> observedCounts.getOrElse(outcome, 0).toString,
+          "empiricalProbability" -> empirical.getOrElse(outcome, 0d).toString,
+          "idealProbability" -> ideal.getOrElse(outcome, 0d).toString,
+          "empiricalMinusIdeal" ->
+            (empirical.getOrElse(outcome, 0d) - ideal.getOrElse(outcome, 0d)).toString
+        )
+      }
+    }
+  }
+  writeCsv(
+    batchDirectory.resolve("distribution-details.csv"),
+    Vector(
+      "experiment",
+      "threshold",
+      "outcome",
+      "observedCount",
+      "empiricalProbability",
+      "idealProbability",
+      "empiricalMinusIdeal"
+    ),
+    distributionDetailRows
+  )
+
   private val comparisonRows = pairwiseComparisons(validRecords, thresholds)
   private val comparisonColumns = Vector(
     "experiment",
@@ -252,7 +491,7 @@ object RepeatedExperimentRunner extends App {
     batchReadme(records.toVector, summaryRows, comparisonRows)
   )
 
-  val failed = records.count(_.exitCode != 0)
+  val failed = records.count(!_.succeeded)
   println(
     s"Repeated experiment complete: ${records.length - failed} successful process(es), " +
       s"$failed failed. Results: ${batchDirectory.resolve("trials.csv")}"
@@ -264,6 +503,7 @@ object RepeatedExperimentRunner extends App {
       trialIndex: Int,
       trialSeed: Long,
       exitCode: Int,
+      childFailureReason: String,
       sampleFile: Path,
       logFile: Path
   ): Map[String, String] = {
@@ -277,13 +517,17 @@ object RepeatedExperimentRunner extends App {
     val activeFraction = ratio("B_active", "B_total")
     val activeCorrectFraction = ratio("B_activecorrect", "B_correct")
     val correctAmongActive = ratio("B_activecorrect", "B_active")
+    val failureReason =
+      if (childFailureReason.nonEmpty) childFailureReason
+      else if (exitCode != 0) s"child process exited with code $exitCode"
+      else if (values.isEmpty) "child process produced no result file"
+      else ""
     values ++ Map(
       "batchId" -> batchId,
       "trialIndex" -> trialIndex.toString,
       "trialSeed" -> trialSeed.toString,
       "processExitCode" -> exitCode.toString,
-      "failureReason" ->
-        (if (exitCode == 0 && values.nonEmpty) "" else s"exit=$exitCode or missing result file"),
+      "failureReason" -> failureReason,
       "threshold" -> threshold.toString,
       "B_activeFraction" -> activeFraction.map(_.toString).getOrElse(""),
       "B_activeCorrectFraction" -> activeCorrectFraction.map(_.toString).getOrElse(""),
@@ -303,6 +547,26 @@ object RepeatedExperimentRunner extends App {
       "B_activeCorrectFraction",
       "B_correctAmongActiveFraction",
       "B_reductionFraction",
+      "developedAmplitudeMagnitude",
+      "maxIncorrectReadyAmplitudeAtSampling",
+      "interferenceReactionsAtSampling",
+      "thresholdTriggerAmplitude.magnitude",
+      "samplingPopulationMoleculesAtSampling",
+      "samplingPopulationEndpointStatesAtSampling",
+      "samplingPopulationAmplitudeSquaredMass",
+      "bornRuleNormalizationFactor",
+      "selectedStateNormalizedBornProbabilityAtSampling",
+      "interferenceCompletionFraction",
+      "interferenceReductionFraction",
+      "idealSampledOutcomeProbability",
+      "selectedStateAggregateAmplitude.magnitude",
+      "maxIncorrectReadyStateAggregateAmplitudeAtSampling",
+      "selectedVsMaxIncorrectStateAmplitudeMargin",
+      "selectedVsMaxIncorrectStateAmplitudeRatio",
+      "selectedStateAmplitudeRank",
+      "readyMoleculesAtSampling",
+      "readyIncorrectMoleculesAtSampling",
+      "distinctReadyEndpointStatesAtSampling",
       "elapsedMillis"
     )
     val pairs = for {
@@ -314,7 +578,12 @@ object RepeatedExperimentRunner extends App {
       val group = valid.filter(_.threshold == threshold).sortBy(_.trialIndex)
       Vector(
         ("B_active", "B_total", "B_active versus B_total"),
-        ("B_activecorrect", "B_correct", "B_activecorrect versus B_correct")
+        ("B_activecorrect", "B_correct", "B_activecorrect versus B_correct"),
+        (
+          "interferenceReactionsAtSampling",
+          "I_full",
+          "interference reactions at sampling versus canonical full interference"
+        )
       ).flatMap {
         case (activeMetric, fullMetric, label) =>
           val pairedValues = group.flatMap { record =>
@@ -441,9 +710,12 @@ object RepeatedExperimentRunner extends App {
       summaries: Vector[Map[String, String]],
       comparisons: Vector[Map[String, String]]
   ): String = {
-    val successful = allRecords.count(_.exitCode == 0)
+    val successful = allRecords.count(_.succeeded)
     val summaryLines = summaries
-      .filter(row => row("metric") == "isCorrect" || row("metric") == "B_activeFraction")
+      .filter(row =>
+        row("metric") == "isCorrect" ||
+          row("metric") == "interferenceReductionFraction"
+      )
       .map { row =>
         s"threshold=${row("threshold")} ${row("metric")}: " +
           s"${row("meanPlusMinusStandardDeviation")}, " +
@@ -452,6 +724,8 @@ object RepeatedExperimentRunner extends App {
     s"""Repeated CHAM experiment batch
        |batchId=$batchId
        |experiment=${ExperimentConfig.circuitAlias}
+       |backend=${ExperimentConfig.repeatedTrialBackend.label}
+       |outcomeSelectionMode=${ExperimentConfig.outcomeSelectionMode.label}
        |requestedTrialsPerThreshold=$trialCount
        |thresholds=${thresholds.mkString(",")}
        |successfulProcesses=$successful
@@ -463,6 +737,8 @@ object RepeatedExperimentRunner extends App {
        |Files
        |trials.csv: one row per fresh-JVM trial
        |summary.csv: mean, sample standard deviation, and 95% confidence interval
+       |distribution-quality.csv: TVD and Hellinger distance with paired bootstrap uncertainty
+       |distribution-details.csv: empirical and exact ideal probability for every outcome
        |pairwise-comparisons.csv: paired t-tests, Wilcoxon signed-rank tests, and exact McNemar tests
        |trials/: complete per-trial result records
        |logs/: complete per-trial process logs
@@ -470,6 +746,55 @@ object RepeatedExperimentRunner extends App {
        |Pairwise comparison rows=${comparisons.length}
        |""".stripMargin
   }
+
+  private def runChild(
+      processBuilder: ProcessBuilder,
+      logFile: Path
+  ): ChildProcessResult = {
+    val process = processBuilder.start()
+    activeChild.set(process)
+    try {
+      val completed = process.waitFor(
+        ExperimentConfig.repeatedTrialTimeoutMinutes,
+        TimeUnit.MINUTES
+      )
+      if (completed) {
+        ChildProcessResult(process.exitValue(), "")
+      } else {
+        terminateChild(process)
+        val message =
+          s"trial timed out after ${ExperimentConfig.repeatedTrialTimeoutMinutes} minute(s)"
+        appendRunnerMessage(logFile, message)
+        ChildProcessResult(124, message)
+      }
+    } catch {
+      case interrupted: InterruptedException =>
+        terminateChild(process)
+        appendRunnerMessage(logFile, "trial interrupted; child process terminated")
+        Thread.currentThread().interrupt()
+        throw interrupted
+    } finally {
+      activeChild.compareAndSet(process, null)
+    }
+  }
+
+  private def terminateChild(process: Process): Unit = {
+    process.destroy()
+    if (!process.waitFor(5L, TimeUnit.SECONDS)) {
+      process.destroyForcibly()
+      process.waitFor(5L, TimeUnit.SECONDS)
+      ()
+    }
+  }
+
+  private def appendRunnerMessage(path: Path, message: String): Unit =
+    Files.write(
+      path,
+      s"\n[repeated-runner] $message\n".getBytes(StandardCharsets.UTF_8),
+      StandardOpenOption.CREATE,
+      StandardOpenOption.APPEND,
+      StandardOpenOption.WRITE
+    )
 
   private def parseKeyValueFile(path: Path): Map[String, String] =
     Files
@@ -511,4 +836,9 @@ object RepeatedExperimentRunner extends App {
 
   private def fileSafeThreshold(threshold: Double): String =
     threshold.toString.replace('-', 'm').replace('.', 'p')
+
+  private def renderDistribution(distribution: Map[String, Double]): String =
+    distribution.toVector.sortBy(_._1).map {
+      case (outcome, probability) => s"$outcome:$probability"
+    }.mkString("|")
 }

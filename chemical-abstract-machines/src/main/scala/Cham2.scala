@@ -47,14 +47,19 @@ object Cham2 extends App {
     val random = new Random(effectiveRandomSeed)
     selection.possibleOracleOutputs(random.nextInt(selection.possibleOracleOutputs.length))
   }
+  private val referenceMetrics =
+    CircuitReferenceMetrics.calculate(experiment, selectedSimonOutput, instanceCount)
+  private val bornRuleRandomSeed = effectiveRandomSeed ^ 0x5DEECE66DL
+  private val outcomeSelectionRandom = new Random(bornRuleRandomSeed)
 
-  private val samplePath =
-    sys.props
-      .get(TrialProcessProtocol.sampleFileProperty)
-      .map(Paths.get(_))
-      .getOrElse(
-        ExperimentConfig.outputDirectory.resolve(s"${experiment.alias}-sampled-state.txt")
-      )
+  private val samplePath = ExperimentOutputPaths.samplePath(
+    explicitPath =
+      sys.props.get(TrialProcessProtocol.sampleFileProperty).map(Paths.get(_)),
+    batchRoot = ExperimentConfig.repeatedTrialOutputDirectory,
+    experimentAlias = experiment.alias,
+    selectionMode = ExperimentConfig.outcomeSelectionMode,
+    threshold = threshold
+  )
   private val sampledState = new SampledStateRecorder(
     configuredOutputPath = Some(samplePath),
     context = Vector(
@@ -63,7 +68,8 @@ object Cham2 extends App {
       "threshold" -> threshold.toString,
       "instances" -> instanceCount.toString,
       "qubits" -> experiment.qubitCount.toString,
-      "randomSeed" -> effectiveRandomSeed.toString
+      "randomSeed" -> effectiveRandomSeed.toString,
+      "outcomeSelectionMode" -> ExperimentConfig.outcomeSelectionMode.label
     ) ++ trialId.map("trialId" -> _).toVector
   )
 
@@ -74,11 +80,13 @@ object Cham2 extends App {
   private val worldIds = new AtomicLong(0L)
   private val stopRequested = new AtomicBoolean(false)
   private val activityLock = new AnyRef
+  private val readyPoolAmplitudeTracker = new ReadyPoolAmplitudeTracker
   private final case class ActivitySnapshot(
       generatedTerminals: Long,
       interferenceReactions: Long,
       bActive: Long,
-      bActiveCorrect: Long
+      bActiveCorrect: Long,
+      selection: ThresholdSelectionDecision
   )
   private val selectedActivity = new AtomicReference[ActivitySnapshot]()
   private val hScale = 1d / math.sqrt(2d)
@@ -86,33 +94,57 @@ object Cham2 extends App {
 
   // A `ready` molecule has completed its circuit and may interfere. A
   // `commit` molecule still has gates to execute and cannot be sampled.
-  private lazy val ready = m[QVec]
+  private lazy val ready = m[ReadyMolecule]
   private lazy val commit = m[(QVec, Circuit, String)]
   private lazy val step = m[Unit]
 
   private lazy val reactionSites: Unit = {
     site(workerPool)(
       go {
-        case ready(left) + ready(right) =>
-          if (stopRequested.get()) {
-            ()
-          } else if (left.v.sameElements(right.v)) {
-            interferenceReactions.increment()
+        case ready(left) + ready(right)
+            if left.state.v.sameElements(right.state.v) =>
+          activityLock.synchronized {
+            readyPoolAmplitudeTracker.consumed(left)
+            readyPoolAmplitudeTracker.consumed(right)
+          }
+
+          if (!stopRequested.get()) {
+            require(
+              left.isCorrect == right.isCorrect,
+              s"Endpoint ${left.state.v} was assigned inconsistent correctness"
+            )
             val combined = QVec(
               Complex(
-                left.prop.real + right.prop.real,
-                left.prop.imag + right.prop.imag
+                left.state.prop.real + right.state.prop.real,
+                left.state.prop.imag + right.state.prop.imag
               ),
-              left.v
+              left.state.v
             )
+            var selected = Option.empty[QVec]
 
-            if (combined.prop.abs >= threshold) {
-              selectSample(combined)
-            } else if (combined.prop.abs != 0d && !stopRequested.get()) {
-              ready(combined)
+            activityLock.synchronized {
+              if (!stopRequested.get()) {
+                // Count only compatible endpoint combinations that actually
+                // completed before the sampling boundary.
+                interferenceReactions.increment()
+                if (combined.prop.abs >= threshold) {
+                  stopRequested.set(true)
+                  val snapshot =
+                    captureActivity(ReadyMolecule(combined, left.isCorrect))
+                  selectedActivity.set(snapshot)
+                  selected = Some(snapshot.selection.selected.state)
+                } else if (combined.prop.abs != 0d) {
+                  emitReadyLocked(combined, left.isCorrect)
+                }
+              }
             }
-          } else if (!stopRequested.get()) {
-            ready(left) + ready(right)
+
+            selected.foreach { stateToRecord =>
+              require(
+                sampledState.tryRecord(stateToRecord),
+                "The selected state recorder was already populated"
+              )
+            }
           }
       }
     )
@@ -149,39 +181,33 @@ object Cham2 extends App {
       commit((next, Circuit(remaining), world)) + step(())
     } else {
       val terminal = terminalState(next)
-      var readyToEmit: Option[QVec] = None
-      var selected: Option[(QVec, ActivitySnapshot)] = None
+      var selected: Option[QVec] = None
 
       activityLock.synchronized {
         if (!stopRequested.get()) {
           generatedTerminalContributions.increment()
           terminal.foreach { terminalState =>
             readyTerminalMolecules.increment()
-            if (experiment.isCorrectTerminalState(terminalState.v)) {
+            val isCorrect = experiment.isCorrectTerminalState(terminalState.v)
+            if (isCorrect) {
               readyCorrectTerminalMolecules.increment()
             }
 
             if (terminalState.prop.abs >= threshold) {
               stopRequested.set(true)
-              val snapshot = captureActivity()
+              val snapshot =
+                captureActivity(ReadyMolecule(terminalState, isCorrect))
               selectedActivity.set(snapshot)
-              selected = Some(terminalState -> snapshot)
+              selected = Some(snapshot.selection.selected.state)
             } else {
-              readyToEmit = Some(terminalState)
+              emitReadyLocked(terminalState, isCorrect)
             }
           }
         }
       }
 
-      selected match {
-        case Some((state, _)) =>
-          require(sampledState.tryRecord(state), "The selected state recorder was already populated")
-        case None =>
-          readyToEmit.foreach { state =>
-            if (!stopRequested.get()) {
-              ready(state)
-            }
-          }
+      selected.foreach { state =>
+        require(sampledState.tryRecord(state), "The selected state recorder was already populated")
       }
       // Simon-discarded paths and stopped paths still return their progress token.
       step(())
@@ -206,30 +232,27 @@ object Cham2 extends App {
         }
     }
 
-  private def selectSample(state: QVec): Unit = {
-    val snapshot = activityLock.synchronized {
-      if (stopRequested.get()) {
-        None
-      } else {
-        stopRequested.set(true)
-        val selectedSnapshot = captureActivity()
-        selectedActivity.set(selectedSnapshot)
-        Some(selectedSnapshot)
-      }
-    }
-
-    snapshot.foreach { _ =>
-      require(sampledState.tryRecord(state), "The selected state recorder was already populated")
-    }
+  /** Must be called while holding activityLock. */
+  private def emitReadyLocked(state: QVec, isCorrect: Boolean): Unit = {
+    val molecule = ReadyMolecule(state, isCorrect)
+    readyPoolAmplitudeTracker.emitted(molecule)
+    ready(molecule)
   }
 
-  private def captureActivity(): ActivitySnapshot =
+  private def captureActivity(thresholdTrigger: ReadyMolecule): ActivitySnapshot = {
+    val selection = readyPoolAmplitudeTracker.select(
+      thresholdTrigger,
+      ExperimentConfig.outcomeSelectionMode,
+      outcomeSelectionRandom
+    )
     ActivitySnapshot(
       generatedTerminals = generatedTerminalContributions.sum(),
       interferenceReactions = interferenceReactions.sum(),
       bActive = readyTerminalMolecules.sum(),
-      bActiveCorrect = readyCorrectTerminalMolecules.sum()
+      bActiveCorrect = readyCorrectTerminalMolecules.sum(),
+      selection = selection
     )
+  }
 
   private def applyGate(
       gate: Gate,
@@ -360,10 +383,13 @@ object Cham2 extends App {
          |instances:   $instanceCount
          |copy source: ${if (ExperimentConfig.instanceCountOverride.isDefined) "override" else "threshold/catalog"}
          |threshold:   $threshold
+         |selection:   ${ExperimentConfig.outcomeSelectionMode.label}
          |Hadamards:   $backendHadamards
          |path scale:  ${formatPathEstimate(backendHadamards)}
          |B_total:     $bTotal ($bTotalPerCopy per copy)
          |B_correct:   $bCorrect ($bCorrectPerCopy per copy)
+         |I_full:      ${referenceMetrics.fullInterferenceReactions}
+         |I endpoints: ${referenceMetrics.fullInterferenceEndpointStates}
          |check bits:  ${experiment.correctOutcomes.observedQubits.mkString(",")}
          |success:     $successTarget
          |output:      ${samplePath.toAbsolutePath.normalize}
@@ -421,6 +447,19 @@ object Cham2 extends App {
   )
   val terminalContributionsAtSelection = activityAtSelection.generatedTerminals
   val interferenceReactionsAtSelection = activityAtSelection.interferenceReactions
+  val developedAmplitudeMagnitude = selected.prop.abs
+  val selectionDecision = activityAtSelection.selection
+  val readyPoolAtSelection = selectionDecision.readyPool
+  val incorrectReadyPoolAtSelection = readyPoolAtSelection.incorrectMolecules
+  val fullInterferenceReactions = referenceMetrics.fullInterferenceReactions
+  val interferenceCompletionFraction =
+    if (fullInterferenceReactions == 0) 1d
+    else
+      (BigDecimal(interferenceReactionsAtSelection) /
+        BigDecimal(fullInterferenceReactions)).toDouble
+  val interferenceReductionFraction = 1d - interferenceCompletionFraction
+  val idealSampledOutcomeProbability =
+    referenceMetrics.idealProbability(observedOutcome)
   val correctnessMetadata =
     experiment.shorPostProcessing match {
       case Some(postProcessing) =>
@@ -443,6 +482,90 @@ object Cham2 extends App {
     Vector(
       "selectedAtTerminalContributions" -> terminalContributionsAtSelection.toString,
       "selectedAtInterferenceReactions" -> interferenceReactionsAtSelection.toString,
+      "interferenceReactionsAtSampling" -> interferenceReactionsAtSelection.toString,
+      "interferenceReactionDefinition" ->
+        "completed compatible endpoint combinations; incompatible molecule encounters excluded",
+      "outcomeSelectionBoundary" -> "first state-molecule threshold crossing",
+      "thresholdTriggerBits" ->
+        selectionDecision.thresholdTrigger.state.v.map(if (_) '1' else '0').mkString,
+      "thresholdTriggerAmplitude.real" ->
+        selectionDecision.thresholdTrigger.state.prop.real.toString,
+      "thresholdTriggerAmplitude.imag" ->
+        selectionDecision.thresholdTrigger.state.prop.imag.toString,
+      "thresholdTriggerAmplitude.magnitude" ->
+        selectionDecision.thresholdTrigger.amplitudeMagnitude.toString,
+      "thresholdTriggerWasSelected" ->
+        selectionDecision.thresholdTriggerWasSelected.toString,
+      "samplingPopulationMoleculesAtSampling" ->
+        selectionDecision.samplingPopulationMoleculeCount.toString,
+      "samplingPopulationEndpointStatesAtSampling" ->
+        selectionDecision.samplingPopulationEndpointStateCount.toString,
+      "samplingPopulationAmplitudeSquaredMass" ->
+        selectionDecision.amplitudeSquaredMass.toString,
+      "bornRuleNormalizationFactor" ->
+        selectionDecision.bornRuleNormalizationFactor.toString,
+      "samplingPopulationNormalizedProbabilitySum" ->
+        selectionDecision.normalizedProbabilitySum.toString,
+      "samplingPopulationBornDistribution" ->
+        selectionDecision.renderedNormalizedStateProbabilities,
+      "selectedStateNormalizedBornProbabilityAtSampling" ->
+        selectionDecision.selectedStateNormalizedBornProbability.toString,
+      "bornRuleRandomDraw" ->
+        selectionDecision.bornRuleRandomDraw.map(_.toString).getOrElse("not-used"),
+      "bornRuleRandomSeed" -> bornRuleRandomSeed.toString,
+      "bornRuleProbabilityDefinition" ->
+        ReadyPoolAmplitudeTracker.bornRuleProbabilityDefinition,
+      "I_full" -> fullInterferenceReactions.toString,
+      "I_fullContributions" ->
+        referenceMetrics.fullInterferenceContributions.toString,
+      "I_fullEndpointStates" ->
+        referenceMetrics.fullInterferenceEndpointStates.toString,
+      "I_fullDefinition" -> CircuitReferenceMetrics.fullInterferenceDefinition,
+      "interferenceCompletionFraction" -> interferenceCompletionFraction.toString,
+      "interferenceReductionFraction" -> interferenceReductionFraction.toString,
+      "idealSampledOutcomeProbability" -> idealSampledOutcomeProbability.toString,
+      "idealOutputDistribution" -> referenceMetrics.renderedIdealDistribution,
+      "idealDistributionDefinition" ->
+        CircuitReferenceMetrics.idealDistributionDefinition,
+      "developedAmplitudeMagnitude" -> developedAmplitudeMagnitude.toString,
+      "maxIncorrectReadyAmplitudeAtSampling" ->
+        incorrectReadyPoolAtSelection.maximumAmplitude.toString,
+      "incorrectReadyMoleculesAtSampling" ->
+        incorrectReadyPoolAtSelection.moleculeCount.toString,
+      "maxIncorrectReadyAmplitudeAtSamplingExact" -> "false",
+      "incorrectReadyPoolSnapshotSemantics" ->
+        ReadyPoolAmplitudeTracker.snapshotSemantics,
+      "selectedStateAggregateAmplitude.real" ->
+        readyPoolAtSelection.selectedStateAggregateAmplitude.real.toString,
+      "selectedStateAggregateAmplitude.imag" ->
+        readyPoolAtSelection.selectedStateAggregateAmplitude.imag.toString,
+      "selectedStateAggregateAmplitude.magnitude" ->
+        readyPoolAtSelection.selectedStateAggregateAmplitudeMagnitude.toString,
+      "maxIncorrectReadyStateAggregateAmplitudeAtSampling" ->
+        readyPoolAtSelection.maximumIncorrectReadyStateAggregateAmplitude.toString,
+      "selectedVsMaxIncorrectStateAmplitudeMargin" ->
+        readyPoolAtSelection.selectedVsMaxIncorrectStateAmplitudeMargin.toString,
+      "selectedVsMaxIncorrectStateAmplitudeRatio" ->
+        readyPoolAtSelection.selectedVsMaxIncorrectStateAmplitudeRatio
+          .map(_.toString)
+          .getOrElse("undefined-no-incorrect-ready-state"),
+      "selectedStateAmplitudeRank" ->
+        readyPoolAtSelection.selectedStateAmplitudeRank.toString,
+      "readyMoleculesAtSampling" ->
+        readyPoolAtSelection.readyMoleculeCount.toString,
+      "readyCorrectMoleculesAtSampling" ->
+        readyPoolAtSelection.correctReadyMoleculeCount.toString,
+      "readyIncorrectMoleculesAtSampling" ->
+        readyPoolAtSelection.incorrectReadyMoleculeCount.toString,
+      "distinctReadyEndpointStatesAtSampling" ->
+        readyPoolAtSelection.distinctReadyEndpointStates.toString,
+      "distinctCorrectReadyEndpointStatesAtSampling" ->
+        readyPoolAtSelection.distinctCorrectReadyEndpointStates.toString,
+      "distinctIncorrectReadyEndpointStatesAtSampling" ->
+        readyPoolAtSelection.distinctIncorrectReadyEndpointStates.toString,
+      "readyPoolStateSnapshotExact" -> "false",
+      "readyPoolStateSnapshotSemantics" ->
+        ReadyPoolAmplitudeTracker.snapshotSemantics,
       "B_total" -> bTotal.toString,
       "B_correct" -> bCorrect.toString,
       "B_active" -> activityAtSelection.bActive.toString,
@@ -453,7 +576,11 @@ object Cham2 extends App {
       "isCorrect" -> isCorrect.toString,
       "correctnessDefinition" -> correctnessDescription,
       "elapsedMillis" -> elapsedMillis.toString
-    ) ++ correctnessMetadata ++ shorPostProcessingResult.toVector.flatMap(_.metadata)
+    ) ++ selectedSimonOutput
+      .map(output =>
+        "selectedSimonOracleOutput" -> output.map(if (_) '1' else '0').mkString
+      )
+      .toVector ++ correctnessMetadata ++ shorPostProcessingResult.toVector.flatMap(_.metadata)
   )
   shorPostProcessingResult.foreach { result =>
     val postProcessing = experiment.shorPostProcessing.get
@@ -464,6 +591,18 @@ object Cham2 extends App {
        |=================== OUTCOME CHECK ====================
        |observed:       $observedBits
        |correct:        ${if (isCorrect) "YES" else "NO"}
+       |selection mode: ${ExperimentConfig.outcomeSelectionMode.label}
+       |trigger:        ${selectionDecision.thresholdTrigger.state.v.map(if (_) '1' else '0').mkString}
+       |developed amp:  $developedAmplitudeMagnitude
+       |state agg amp:  ${readyPoolAtSelection.selectedStateAggregateAmplitudeMagnitude}
+       |max wrong state:${readyPoolAtSelection.maximumIncorrectReadyStateAggregateAmplitude}
+       |state rank:     ${readyPoolAtSelection.selectedStateAmplitudeRank}
+       |interference:   $interferenceReactionsAtSelection / $fullInterferenceReactions
+       |I reduction:    $interferenceReductionFraction
+       |distribution p: $idealSampledOutcomeProbability
+       |partial mass:   ${selectionDecision.amplitudeSquaredMass}
+       |partial p:      ${selectionDecision.selectedStateNormalizedBornProbability}
+       |ready soup:     ${readyPoolAtSelection.readyMoleculeCount} molecule(s), ${readyPoolAtSelection.distinctReadyEndpointStates} state(s)
        |B_total:        $bTotal
        |B_correct:      $bCorrect
        |B_active:       ${activityAtSelection.bActive}

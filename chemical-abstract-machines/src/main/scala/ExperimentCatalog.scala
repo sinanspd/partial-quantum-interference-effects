@@ -302,11 +302,7 @@ object ExperimentCatalog {
   private val grover30PhaseAncilla = 29
   private val grover30MarkedState = bits("01111111")
 
-  // The first eight clauses are unit clauses written in valid 3-CNF form as
-  // (l ∨ l ∨ l), and are compiled to the equivalent single-literal circuit.
-  // Together they force the unique assignment |01111111>. The final two
-  // clauses are redundant genuine three-literal clauses; they exercise both
-  // dedicated clause-work ancillas without changing the unique solution.
+
   private val grover30ComputeClauses: List[Gate] =
     List(X(8), CX(0, 8)) ++
       (1 until 8).map(q => CX(q, q + 8): Gate).toList ++

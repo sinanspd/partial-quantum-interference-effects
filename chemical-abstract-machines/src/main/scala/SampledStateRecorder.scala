@@ -1,6 +1,7 @@
 package com.sinanspd
 
 import com.sinanspd.qure.circuit.QVec
+import spire.implicits._
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
@@ -47,6 +48,7 @@ final class SampledStateRecorder(
             s"bits=$bits\n" +
             s"amplitude.real=${sample.prop.real}\n" +
             s"amplitude.imag=${sample.prop.imag}\n" +
+            s"amplitude.magnitude=${sample.prop.abs}\n" +
             s"molecule=$sample\n"
 
         val fileStatus = writeResult(contents)
@@ -56,6 +58,7 @@ final class SampledStateRecorder(
                |==================== SAMPLED STATE ====================
                |bits:      $bits
                |amplitude: ${sample.prop}
+               |magnitude: ${sample.prop.abs}
                |molecule:  $sample
                |${context.map { case (key, value) => s"$key: $value" }.mkString(", ")}
                |$fileStatus
