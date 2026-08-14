@@ -37,13 +37,13 @@ case object BornRuleSampling extends OutcomeSelectionMode {
 /**
   * Source-level experiment selection.
   *
-  * This is deliberately not a command-line interface: edit `circuitAlias` and
+  * Edit `circuitAlias` and
   * run `sbt run`. The remaining values are kept here so a run can be
   * reproduced from a single source revision.
   */
 object ExperimentConfig {
   val circuitAlias: String = "simon-n5"
-  val threshold: Double = 0.1
+  val threshold: Double = 0.9
 
   /** None lets tagged Grover experiments choose the minimum copy count whose
     * final marked amplitude can reach `threshold`; other experiments use their
@@ -60,7 +60,7 @@ object ExperimentConfig {
   val completionJitterMillis: Int = 40
   val shutdownDrainMillis: Int = 25
   val randomSeed: Long = 260601922L
-  val outcomeSelectionMode: OutcomeSelectionMode = FirstThresholdCrossing
+  val outcomeSelectionMode: OutcomeSelectionMode = BornRuleSampling
   val preflightOnly: Boolean = false
   val terminateAfterSample: Boolean = true
 

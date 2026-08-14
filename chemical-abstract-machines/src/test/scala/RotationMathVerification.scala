@@ -142,7 +142,7 @@ object RotationMathVerification extends App {
   }
 
   private val satResult =
-    ExperimentCatalog.grover3Sat.gates.foldLeft(zeroState(3)) {
+    ExperimentCatalog.grover3Sat3QApprox.gates.foldLeft(zeroState(3)) {
       case (state, gate) => applyGate(state, gate, qubits = 3)
     }
   private val satProbabilities = satResult.map(magnitudeSquared)
@@ -150,15 +150,15 @@ object RotationMathVerification extends App {
 
   assert(
     close(satProbabilities.sum, 1d),
-    s"grover-3sat lost normalization: ${satProbabilities.sum}"
+    s"grover-3sat-3q-approx lost normalization: ${satProbabilities.sum}"
   )
   assert(
     satProbabilities(markedIndex) == satProbabilities.max,
-    s"grover-3sat does not make 011 the most likely state: $satProbabilities"
+    s"grover-3sat-3q-approx does not make 011 the most likely state: $satProbabilities"
   )
   assert(
     close(satProbabilities(markedIndex), 0.5609296083845561),
-    s"unexpected grover-3sat marked probability: ${satProbabilities(markedIndex)}"
+    s"unexpected grover-3sat-3q-approx marked probability: ${satProbabilities(markedIndex)}"
   )
 
   // This is the historical seven-controlled-rotation decomposition used by

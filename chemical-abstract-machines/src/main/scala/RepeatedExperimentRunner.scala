@@ -52,6 +52,9 @@ object RepeatedExperimentRunner extends App {
     ExperimentConfig.distributionBootstrapReplicates > 0,
     "distributionBootstrapReplicates must be positive"
   )
+  private val experiment =
+    ExperimentCatalog(ExperimentConfig.circuitAlias)
+  private val experimentAlias = experiment.alias
 
   if (trialCount < 50) {
     Console.err.println(
@@ -66,7 +69,7 @@ object RepeatedExperimentRunner extends App {
   private val label = ExperimentConfig.repeatedTrialBatchLabel
     .map(_.replaceAll("[^A-Za-z0-9._-]", "_"))
     .filter(_.nonEmpty)
-    .getOrElse(ExperimentConfig.circuitAlias)
+    .getOrElse(experimentAlias)
   private val batchId = s"$label-$timestamp"
   private val batchDirectory =
     ExperimentConfig.repeatedTrialOutputDirectory.resolve(batchId).toAbsolutePath.normalize
@@ -91,7 +94,7 @@ object RepeatedExperimentRunner extends App {
   )
 
   println(
-    s"Starting $trialCount fresh-JVM trial(s) for ${ExperimentConfig.circuitAlias} " +
+    s"Starting $trialCount fresh-JVM trial(s) for $experimentAlias " +
       s"at threshold(s) ${thresholds.mkString(", ")}"
   )
   println(s"Trial backend: ${ExperimentConfig.repeatedTrialBackend.label}")
@@ -106,7 +109,8 @@ object RepeatedExperimentRunner extends App {
 
     (1 to trialCount).foreach { trialIndex =>
       val trialId = f"$trialIndex%04d"
-      val trialSeed = ExperimentConfig.randomSeed + trialIndex.toLong - 1L
+      val trialSeed =
+        ExperimentRandom.trialSeed(ExperimentConfig.randomSeed, trialIndex)
       val sampleFile = thresholdTrialDirectory.resolve(s"trial-$trialId.txt")
       val logFile = thresholdLogDirectory.resolve(s"trial-$trialId.log")
       val command = Vector(
@@ -166,6 +170,7 @@ object RepeatedExperimentRunner extends App {
     "qubits",
     "backend",
     "randomSeed",
+    "postSelectionRandomSeed",
     "outcomeSelectionMode",
     "outcomeSelectionBoundary",
     "bits",
@@ -218,6 +223,10 @@ object RepeatedExperimentRunner extends App {
     "idealSampledOutcomeProbability",
     "idealOutputDistribution",
     "idealDistributionDefinition",
+    "selectedPostSelectionOutcome",
+    "postSelectionProbability",
+    "postSelectionAmplitudeScale",
+    "postSelectionDescription",
     "selectedSimonOracleOutput",
     "selectedStateAggregateAmplitude.real",
     "selectedStateAggregateAmplitude.imag",
@@ -322,7 +331,7 @@ object RepeatedExperimentRunner extends App {
           TrialStatistics.summarize(values, proportion = binaryMetrics.contains(metric))
         Some(
           Map(
-            "experiment" -> ExperimentConfig.circuitAlias,
+            "experiment" -> experimentAlias,
             "threshold" -> threshold.toString,
             "metric" -> metric,
             "n" -> summary.count.toString,
@@ -377,11 +386,14 @@ object RepeatedExperimentRunner extends App {
       val bootstrap = OutputDistributionMetrics.bootstrap(
         observations,
         ExperimentConfig.distributionBootstrapReplicates,
-        ExperimentConfig.randomSeed ^ java.lang.Double.doubleToLongBits(threshold)
+        ExperimentRandom.bootstrapSeed(
+          ExperimentConfig.randomSeed,
+          java.lang.Double.doubleToLongBits(threshold)
+        )
       )
       Some(
         Map(
-          "experiment" -> ExperimentConfig.circuitAlias,
+          "experiment" -> experimentAlias,
           "threshold" -> threshold.toString,
           "n" -> observations.length.toString,
           "totalVariationDistance" -> distance.totalVariationDistance.toString,
@@ -443,7 +455,7 @@ object RepeatedExperimentRunner extends App {
       }
       (empirical.keySet ++ ideal.keySet).toVector.sorted.map { outcome =>
         Map(
-          "experiment" -> ExperimentConfig.circuitAlias,
+          "experiment" -> experimentAlias,
           "threshold" -> threshold.toString,
           "outcome" -> outcome,
           "observedCount" -> observedCounts.getOrElse(outcome, 0).toString,
@@ -524,6 +536,7 @@ object RepeatedExperimentRunner extends App {
       else ""
     values ++ Map(
       "batchId" -> batchId,
+      "experiment" -> experimentAlias,
       "trialIndex" -> trialIndex.toString,
       "trialSeed" -> trialSeed.toString,
       "processExitCode" -> exitCode.toString,
@@ -676,7 +689,7 @@ object RepeatedExperimentRunner extends App {
       result: HypothesisTestResult
   ): Map[String, String] =
     Map(
-      "experiment" -> ExperimentConfig.circuitAlias,
+      "experiment" -> experimentAlias,
       "thresholdA" -> thresholdA.toString,
       "thresholdB" -> thresholdB.toString,
       "metric" -> metric,
@@ -694,7 +707,7 @@ object RepeatedExperimentRunner extends App {
       result: HypothesisTestResult
   ): Map[String, String] =
     Map(
-      "experiment" -> ExperimentConfig.circuitAlias,
+      "experiment" -> experimentAlias,
       "thresholdA" -> threshold.toString,
       "thresholdB" -> "full-simulation",
       "metric" -> metric,
@@ -723,7 +736,7 @@ object RepeatedExperimentRunner extends App {
       }
     s"""Repeated CHAM experiment batch
        |batchId=$batchId
-       |experiment=${ExperimentConfig.circuitAlias}
+       |experiment=$experimentAlias
        |backend=${ExperimentConfig.repeatedTrialBackend.label}
        |outcomeSelectionMode=${ExperimentConfig.outcomeSelectionMode.label}
        |requestedTrialsPerThreshold=$trialCount

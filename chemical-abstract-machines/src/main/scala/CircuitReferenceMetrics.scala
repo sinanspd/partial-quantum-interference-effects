@@ -1,5 +1,6 @@
 package com.sinanspd
 
+import com.sinanspd.qure.circuit.QVec
 import com.sinanspd.qure.circuit.gates._
 import spire.implicits._
 import spire.math.Complex
@@ -44,6 +45,56 @@ final case class CircuitReferenceMetrics(
     state.map(if (_) '1' else '0').mkString
 }
 
+/**
+  * Closed-form reference data for circuits whose exact state space is too
+  * large to enumerate during catalog startup.
+  */
+final case class AnalyticalCircuitReference(
+    fullInterferenceContributionsPerCopy: BigInt,
+    fullInterferenceEndpointStates: Int,
+    idealOutputProbabilities: Map[Vector[Boolean], Double]
+) {
+  require(
+    fullInterferenceContributionsPerCopy > 0,
+    "Analytical reference contributions must be positive"
+  )
+  require(
+    fullInterferenceEndpointStates > 0,
+    "Analytical reference endpoint count must be positive"
+  )
+  require(
+    idealOutputProbabilities.nonEmpty,
+    "Analytical reference distribution cannot be empty"
+  )
+  require(
+    fullInterferenceContributionsPerCopy >= BigInt(fullInterferenceEndpointStates),
+    "Analytical reference contributions cannot be fewer than its endpoint states"
+  )
+  require(
+    idealOutputProbabilities.values.forall(probability =>
+      probability >= 0d && java.lang.Double.isFinite(probability)
+    ),
+    "Analytical reference probabilities must be finite and non-negative"
+  )
+  require(
+    math.abs(idealOutputProbabilities.values.sum - 1d) <= 1e-9d,
+    "Analytical reference probabilities must sum to one"
+  )
+
+  def forInstances(instanceCount: Int): CircuitReferenceMetrics = {
+    require(instanceCount > 0, "Reference metrics require at least one circuit instance")
+    val contributions =
+      fullInterferenceContributionsPerCopy * BigInt(instanceCount)
+    CircuitReferenceMetrics(
+      fullInterferenceContributions = contributions,
+      fullInterferenceEndpointStates = fullInterferenceEndpointStates,
+      fullInterferenceReactions =
+        contributions - BigInt(fullInterferenceEndpointStates),
+      idealOutputProbabilities = idealOutputProbabilities
+    )
+  }
+}
+
 object CircuitReferenceMetrics {
   val fullInterferenceDefinition: String =
     "canonical compatible binary additions sum_s(B_s-1) over terminal-policy-admitted endpoint contributions"
@@ -55,14 +106,19 @@ object CircuitReferenceMetrics {
 
   def calculate(
       experiment: ExperimentSpec,
-      selectedSimonOutput: Option[Vector[Boolean]],
+      selectedPostSelectionOutcome: Option[Vector[Boolean]],
       instanceCount: Int
   ): CircuitReferenceMetrics = {
     require(instanceCount > 0, "Reference metrics require at least one circuit instance")
-    require(
-      experiment.simonPostSelection.isDefined == selectedSimonOutput.isDefined,
-      s"${experiment.alias} requires exactly one Simon post-selection choice when configured"
+    val terminalPolicy = TerminalStatePolicy.resolve(
+      experiment,
+      selectedPostSelectionOutcome
     )
+    experiment.analyticalReferenceMetrics match {
+      case Some(reference) =>
+        return reference.forInstances(instanceCount)
+      case None => ()
+    }
 
     val fullStates = experiment.gates.foldLeft(
       Map(experiment.initialState.v -> StateCell(BigInt(1), experiment.initialState.prop))
@@ -75,12 +131,13 @@ object CircuitReferenceMetrics {
 
     fullStates.foreach {
       case (fullState, cell) =>
-        terminalEndpoint(experiment, selectedSimonOutput, fullState).foreach { endpoint =>
+        terminalPolicy(QVec(cell.amplitude, fullState)).foreach { terminalState =>
+          val endpoint = terminalState.v
           endpointCounts.update(endpoint, endpointCounts(endpoint) + cell.pathCount)
           val observed = experiment.correctOutcomes.observe(endpoint)
           val probabilityWeight =
-            cell.amplitude.real * cell.amplitude.real +
-              cell.amplitude.imag * cell.amplitude.imag
+            terminalState.prop.real * terminalState.prop.real +
+              terminalState.prop.imag * terminalState.prop.imag
           outcomeWeights.update(observed, outcomeWeights(observed) + probabilityWeight)
         }
     }
@@ -93,6 +150,10 @@ object CircuitReferenceMetrics {
     require(
       normalization > 0d && java.lang.Double.isFinite(normalization),
       s"${experiment.alias} has an invalid ideal-distribution normalization $normalization"
+    )
+    require(
+      math.abs(normalization - 1d) <= 1e-9d,
+      s"${experiment.alias} terminal policy produced total Born mass $normalization instead of 1"
     )
 
     val copies = BigInt(instanceCount)
@@ -112,20 +173,6 @@ object CircuitReferenceMetrics {
       idealOutputProbabilities = probabilities
     )
   }
-
-  private def terminalEndpoint(
-      experiment: ExperimentSpec,
-      selectedSimonOutput: Option[Vector[Boolean]],
-      fullState: Vector[Boolean]
-  ): Option[Vector[Boolean]] =
-    experiment.simonPostSelection match {
-      case Some(selection) =>
-        if (fullState.takeRight(selection.inputQubits) == selectedSimonOutput.get)
-          Some(fullState.take(selection.inputQubits))
-        else None
-      case None =>
-        Some(experiment.resultQubits.map(_.map(fullState)).getOrElse(fullState))
-    }
 
   private def applyGate(
       states: Map[Vector[Boolean], StateCell],

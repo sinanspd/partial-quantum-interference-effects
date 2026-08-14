@@ -67,13 +67,20 @@ object Main extends App {
   require(ExperimentConfig.shutdownDrainMillis >= 0, "shutdownDrainMillis cannot be negative")
   require(experiment.gates.nonEmpty, s"${experiment.alias} has no gates to stream")
 
-  private val selectedSimonOutput = experiment.simonPostSelection.map { selection =>
-    val random = new Random(effectiveRandomSeed)
-    selection.possibleOracleOutputs(random.nextInt(selection.possibleOracleOutputs.length))
-  }
+  private val postSelectionRandomSeed =
+    ExperimentRandom.postSelectionSeed(effectiveRandomSeed)
+  private val terminalPolicy =
+    TerminalStatePolicy.select(experiment, new Random(postSelectionRandomSeed))
+  private val selectedPostSelectionOutcome =
+    terminalPolicy.postSelection.map(_.outcome.bits)
   private val referenceMetrics =
-    CircuitReferenceMetrics.calculate(experiment, selectedSimonOutput, instanceCount)
-  private val bornRuleRandomSeed = effectiveRandomSeed ^ 0x5DEECE66DL
+    CircuitReferenceMetrics.calculate(
+      experiment,
+      selectedPostSelectionOutcome,
+      instanceCount
+    )
+  private val bornRuleRandomSeed =
+    ExperimentRandom.bornRuleSeed(effectiveRandomSeed)
   private val outcomeSelectionRandom = new Random(bornRuleRandomSeed)
   private val fs2BranchJitterSeed =
     Fs2BranchJitter.resolveSeed(ExperimentConfig.fs2BranchJitterSeedOverride)
@@ -95,6 +102,7 @@ object Main extends App {
       "instances" -> instanceCount.toString,
       "qubits" -> experiment.qubitCount.toString,
       "randomSeed" -> effectiveRandomSeed.toString,
+      "postSelectionRandomSeed" -> postSelectionRandomSeed.toString,
       "outcomeSelectionMode" -> ExperimentConfig.outcomeSelectionMode.label,
       "fs2BranchJitterMillis" -> ExperimentConfig.fs2BranchJitterMillis.toString,
       "fs2BranchJitterSeed" -> fs2BranchJitterSeed.toString
@@ -214,22 +222,7 @@ object Main extends App {
   }
 
   private def terminalState(state: QVec): Option[QVec] =
-    experiment.simonPostSelection match {
-      case Some(selection) =>
-        val measuredOutput = selectedSimonOutput.get
-        if (state.v.takeRight(selection.inputQubits).sameElements(measuredOutput)) {
-          Some(QVec(state.prop, state.v.take(selection.inputQubits)))
-        } else {
-          None
-        }
-      case None =>
-        experiment.resultQubits match {
-          case Some(qubits) =>
-            Some(QVec(state.prop, qubits.map(state.v)))
-          case None =>
-            Some(state)
-        }
-    }
+    terminalPolicy(state)
 
   /** Must be called while holding activityLock. */
   private def emitReadyLocked(state: QVec, isCorrect: Boolean): Unit = {
@@ -507,8 +500,13 @@ object Main extends App {
          |======================================================""".stripMargin
     )
 
-    selectedSimonOutput.foreach { output =>
-      println(s"Simon post-selected oracle output: ${output.map(if (_) '1' else '0').mkString}")
+    terminalPolicy.postSelection.foreach { selection =>
+      println(
+        s"Post-selected terminal outcome: " +
+          s"${selection.outcome.bits.map(if (_) '1' else '0').mkString}; " +
+          s"probability=${selection.outcome.probability}; " +
+          s"amplitude scale=${selection.amplitudeScale}"
+      )
     }
     experiment.paperTerminalContributions.foreach { total =>
       println(s"Paper terminal-contribution count: $total")
@@ -735,11 +733,17 @@ object Main extends App {
       "isCorrect" -> isCorrect.toString,
       "correctnessDefinition" -> correctnessDescription,
       "elapsedMillis" -> elapsedMillis.toString
-    ) ++ selectedSimonOutput
-      .map(output =>
-        "selectedSimonOracleOutput" -> output.map(if (_) '1' else '0').mkString
+    ) ++ terminalPolicy.postSelection.toVector.flatMap { selection =>
+      val bits = selection.outcome.bits.map(if (_) '1' else '0').mkString
+      Vector(
+        "selectedPostSelectionOutcome" -> bits,
+        "postSelectionProbability" -> selection.outcome.probability.toString,
+        "postSelectionAmplitudeScale" -> selection.amplitudeScale.toString,
+        "postSelectionDescription" -> selection.spec.description,
+        // Retained for compatibility with existing Simon result analysis.
+        "selectedSimonOracleOutput" -> bits
       )
-      .toVector ++ correctnessMetadata ++ shorPostProcessingResult.toVector.flatMap(_.metadata)
+    } ++ correctnessMetadata ++ shorPostProcessingResult.toVector.flatMap(_.metadata)
   )
 
   shorPostProcessingResult.foreach { result =>

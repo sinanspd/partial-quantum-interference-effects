@@ -10,7 +10,12 @@ final case class CircuitLeafMetrics(total: BigInt, correct: BigInt)
 object CircuitLeafMetrics {
   private type LeafCounts = Map[Vector[Boolean], BigInt]
 
-  def calculate(experiment: ExperimentSpec): CircuitLeafMetrics = {
+  def calculate(experiment: ExperimentSpec): CircuitLeafMetrics =
+    experiment.analyticalLeafMetrics.getOrElse(calculateByEnumeration(experiment))
+
+  private def calculateByEnumeration(
+      experiment: ExperimentSpec
+  ): CircuitLeafMetrics = {
     val terminalCounts = experiment.gates.foldLeft(
       Map(experiment.initialState.v -> BigInt(1))
     ) {
@@ -24,12 +29,29 @@ object CircuitLeafMetrics {
       s"${experiment.alias} leaf count $total does not match 2^${experiment.hadamardCount}"
     )
 
-    val correct = terminalCounts.foldLeft(BigInt(0)) {
-      case (sum, (state, leaves)) =>
-        val terminalState =
-          experiment.resultQubits.map(qubits => qubits.map(state)).getOrElse(state)
-        if (experiment.isCorrectTerminalState(terminalState)) sum + leaves else sum
+    val selectedOutcomes = experiment.postSelection
+      .map(_.outcomes.map(outcome => Some(outcome.bits)))
+      .getOrElse(Vector(None))
+    val correctBySelectedOutcome = selectedOutcomes.map { selectedOutcome =>
+      val terminalPolicy =
+        TerminalStatePolicy.resolve(experiment, selectedOutcome)
+      terminalCounts.foldLeft(BigInt(0)) {
+        case (sum, (state, leaves)) =>
+          terminalPolicy.projectBits(state) match {
+            case Some(terminalState)
+                if experiment.isCorrectTerminalState(terminalState) =>
+              sum + leaves
+            case _ =>
+              sum
+          }
+      }
     }
+    require(
+      correctBySelectedOutcome.distinct.length == 1,
+      s"${experiment.alias} B_correct depends on the selected post-selection outcome: " +
+        correctBySelectedOutcome.distinct.mkString(", ")
+    )
+    val correct = correctBySelectedOutcome.head
 
     CircuitLeafMetrics(total = total, correct = correct)
   }

@@ -6,7 +6,7 @@ object ReferenceMetricsVerification extends App {
 
   val grover = CircuitReferenceMetrics.calculate(
     ExperimentCatalog.grover4Tagged,
-    selectedSimonOutput = None,
+    selectedPostSelectionOutcome = None,
     instanceCount = 1
   )
   assert(grover.fullInterferenceContributions == 4096)
@@ -23,7 +23,7 @@ object ReferenceMetricsVerification extends App {
   val simonOutput = Vector(false, false, false)
   val simon = CircuitReferenceMetrics.calculate(
     ExperimentCatalog.simonN3,
-    selectedSimonOutput = Some(simonOutput),
+    selectedPostSelectionOutcome = Some(simonOutput),
     instanceCount = 3
   )
   assert(simon.fullInterferenceContributions == 48)
@@ -41,12 +41,12 @@ object ReferenceMetricsVerification extends App {
 
   ExperimentCatalog.all.foreach { experiment =>
     val selectedOutput =
-      experiment.simonPostSelection.map(_.possibleOracleOutputs.head)
+      experiment.postSelection.map(_.outcomes.head.bits)
     val metrics =
       CircuitReferenceMetrics.calculate(experiment, selectedOutput, instanceCount = 1)
     assert(approximately(metrics.idealOutputProbabilities.values.sum, 1d))
     assert(metrics.fullInterferenceReactions >= 0)
-    if (experiment.simonPostSelection.isEmpty) {
+    if (experiment.postSelection.isEmpty) {
       assert(metrics.fullInterferenceContributions == experiment.leafMetrics.total)
     }
   }
